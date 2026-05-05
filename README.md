@@ -1,46 +1,51 @@
 # deepseek-responses-adapter
 
-Local adapter that lets Codex talk to DeepSeek when Codex requires
-`wire_api = "responses"` but the upstream provider exposes Chat Completions.
+Rust adapter that lets Codex use DeepSeek when Codex is configured with
+`wire_api = "responses"` but the upstream only exposes OpenAI-compatible Chat
+Completions.
 
-Codex sends:
+The adapter accepts:
 
 ```text
 POST /v1/responses
 ```
 
-This adapter calls:
+and forwards a translated streaming request to:
 
 ```text
 POST https://api.deepseek.com/chat/completions
 ```
 
-Then it emits Responses-style SSE events back to Codex. The upstream DeepSeek
-request uses `stream: true` plus `stream_options.include_usage`.
+It then streams Responses-style SSE events back to Codex.
 
 ## Run
 
+Create `.env` in this directory:
+
 ```bash
-cd /home/dahai003/repo/codex_learn/deepseek-responses-adapter
-export DEEPSEEK_API_KEY="..."
-UV_CACHE_DIR=/tmp/uv-cache uv run --no-project python deepseek_responses_adapter.py --host 127.0.0.1 --port 8787
+DEEPSEEK_API_KEY=sk-...
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-v4-pro
+DEEPSEEK_TIMEOUT=120
+ADAPTER_HOST=127.0.0.1
+ADAPTER_PORT=8787
 ```
 
-If your system has Python installed, `python3 deepseek_responses_adapter.py ...`
-works too.
-
-Optional environment variables:
+For flash-only testing, set:
 
 ```bash
-export DEEPSEEK_BASE_URL="https://api.deepseek.com"
-export DEEPSEEK_MODEL="deepseek-v4-pro"
-export DEEPSEEK_THINKING="disabled"  # keep disabled for Codex compatibility
-export DEEPSEEK_TIMEOUT="120"
+DEEPSEEK_MODEL=deepseek-v4-flash
+```
+
+Start the adapter:
+
+```bash
+cargo run
 ```
 
 ## Codex Config
 
-Add a provider to `~/.codex/config.toml`:
+Add this to `~/.codex/config.toml`:
 
 ```toml
 model = "deepseek-v4-pro"
@@ -50,44 +55,60 @@ model_provider = "deepseek-responses-adapter"
 name = "DeepSeek Responses Adapter"
 base_url = "http://127.0.0.1:8787/v1"
 wire_api = "responses"
-requires_openai_auth = false
-```
+env_key = "DEEPSEEK_API_KEY"
 
-If you prefer profile-scoped usage:
-
-```toml
 [profiles.deepseek]
 model = "deepseek-v4-pro"
 model_provider = "deepseek-responses-adapter"
+model_reasoning_effort = "high"
 ```
 
-Run Codex with:
+Then run:
 
 ```bash
 codex -p deepseek
 ```
 
-## What It Supports
+## Translation Rules
 
-- Responses `message` input to Chat `system` / `user` / `assistant` messages.
-- Responses `function_call_output` to Chat `tool` messages.
-- Responses `function` tools to Chat `function` tools.
-- Responses `namespace` tools flattened into valid Chat function names, then
-  expanded back into Responses `function_call` items for Codex.
-- DeepSeek streamed `delta.content` to Responses `response.output_text.delta`,
-  followed by a final Responses `message` output item.
-- DeepSeek streamed tool call chunks to Responses `function_call` output items.
+- Responses `instructions` becomes a Chat `system` message.
+- Responses `message` input becomes Chat `system`, `user`, or `assistant`
+  messages.
+- Responses `function_call_output` becomes a Chat `tool` message.
+- Responses `function` tools become Chat `function` tools.
+- Namespaced tools are flattened into Chat-safe function names and decoded back
+  when streamed to Codex.
+- DeepSeek streamed `delta.content` becomes `response.output_text.delta`.
+- DeepSeek streamed tool calls are accumulated and emitted as Responses
+  `function_call` items.
+- Assistant tool-call history is only forwarded when every `tool_call_id` has a
+  matching tool result, which avoids DeepSeek/OpenAI chat sequencing errors.
 
-The adapter intentionally does not implement WebSocket transport, image input,
-or web search.
+## Thinking Mode
 
-Keep DeepSeek thinking mode disabled for Codex use. DeepSeek requires
-`reasoning_content` from thinking-mode assistant messages to be passed back on
-later requests, but Codex's Responses history does not preserve that field for
-this adapter.
+Codex already has `model_reasoning_effort`; the adapter forwards that as
+DeepSeek `reasoning_effort` where possible.
 
-## Verify
+DeepSeek `thinking.enabled` is a separate protocol mode. In thinking mode with
+tool calls, DeepSeek requires the assistant message's `reasoning_content` to be
+passed back during the same tool-call sub-turn. This Rust adapter keeps an
+in-memory reasoning store keyed by tool call id and can replay that field for
+the tool-result continuation request.
+
+Enable it only when you need DeepSeek thinking semantics:
 
 ```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run --no-project python -m unittest -v
+DEEPSEEK_THINKING=enabled
+```
+
+For normal Codex usage, leaving `DEEPSEEK_THINKING` unset is the safest default.
+If it is set to `disabled`, the adapter treats that as "do not send the
+DeepSeek `thinking` field" so it remains compatible with Codex
+`model_reasoning_effort`.
+
+## Development
+
+```bash
+cargo fmt
+cargo test
 ```
