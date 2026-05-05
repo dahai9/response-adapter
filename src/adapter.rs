@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 
-use crate::config::{Backend, Config, ThinkingMode};
+use crate::config::{Config, ThinkingMode};
 
 pub type JsonMap = Map<String, Value>;
 
@@ -92,11 +92,11 @@ pub struct ConvertedRequest {
     pub mapper: ToolNameMapper,
 }
 
-pub fn build_deepseek_body(
+pub fn build_chat_body(
     request: &Value,
     config: &Config,
     reasoning_store: &ReasoningStore,
-) -> ConvertedRequest {
+) -> anyhow::Result<ConvertedRequest> {
     let mut mapper = ToolNameMapper::default();
     let mut messages = Vec::new();
     if let Some(instructions) = request.get("instructions").and_then(Value::as_str) {
@@ -106,8 +106,8 @@ pub fn build_deepseek_body(
     }
 
     let tools = convert_tools(request.get("tools"), &mut mapper);
-    let effort = reasoning_effort_for_deepseek(request);
-    let attach_reasoning = config.backend == Backend::DeepSeek && (config.thinking == Some(ThinkingMode::Enabled) || effort.is_some());
+    let effort = resolve_reasoning_effort(request);
+    let attach_reasoning = config.thinking == Some(ThinkingMode::Enabled) || effort.is_some();
     messages.extend(convert_input(
         request.get("input"),
         &mut mapper,
@@ -121,11 +121,7 @@ pub fn build_deepseek_body(
         messages
     };
 
-    let model = config.resolve_model(
-        request
-            .get("model")
-            .and_then(Value::as_str),
-    );
+    let model = config.resolve_model(request.get("model").and_then(Value::as_str))?;
 
     let mut body = json!({
         "model": model,
@@ -139,17 +135,15 @@ pub fn build_deepseek_body(
         body["tool_choice"] = Value::String("auto".into());
     }
 
-    if config.backend == Backend::DeepSeek {
     if let Some(effort) = effort {
-        body["reasoning_effort"] = Value::String(effort.into());
+        body["reasoning_effort"] = Value::String(effort.to_string());
     }
 
     if config.thinking == Some(ThinkingMode::Enabled) {
         body["thinking"] = json!({"type": ThinkingMode::Enabled.as_str()});
     }
-    }
 
-    ConvertedRequest { body, mapper }
+    Ok(ConvertedRequest { body, mapper })
 }
 
 pub fn convert_tools(tools: Option<&Value>, mapper: &mut ToolNameMapper) -> Vec<Value> {
@@ -163,7 +157,7 @@ pub fn convert_tools(tools: Option<&Value>, mapper: &mut ToolNameMapper) -> Vec<
         };
         // Handle namespace-type tools by flattening into individual function tools.
         // The Responses API "namespace" type groups tools under a server/namespace name,
-        // but DeepSeek Chat Completions only supports flat function tools.
+        // but Chat Completions only supports flat function tools.
         if tool_type == "namespace" {
             let namespace_name = tool.get("name").and_then(Value::as_str).unwrap_or("");
             if let Some(Value::Array(inner_tools)) = tool.get("tools") {
@@ -488,7 +482,7 @@ impl StreamingAccumulator {
                 .map(ToOwned::to_owned);
         }
         if let Some(usage) = chunk.get("usage").filter(|u| u.is_object()) {
-            self.usage = Some(codex_usage_from_chat_usage(usage));
+            self.usage = Some(responses_usage_from_chat_usage(usage));
         }
 
         let mut events = Vec::new();
@@ -585,7 +579,7 @@ impl StreamingAccumulator {
     }
 }
 
-pub fn codex_usage_from_chat_usage(usage: &Value) -> Value {
+pub fn responses_usage_from_chat_usage(usage: &Value) -> Value {
     let input = usage
         .get("prompt_tokens")
         .and_then(Value::as_u64)
@@ -616,44 +610,7 @@ pub fn codex_usage_from_chat_usage(usage: &Value) -> Value {
     })
 }
 
-pub fn models_response() -> Value {
-    json!({
-        "object": "list",
-        "data": [
-            model_info("deepseek-v4-pro", "DeepSeek V4 Pro", 0),
-            model_info("deepseek-v4-flash", "DeepSeek V4 Flash", 1),
-            model_info("deepseek-chat", "DeepSeek Chat", 2),
-            model_info("deepseek-reasoner", "DeepSeek Reasoner", 3)
-        ]
-    })
-}
-
-fn model_info(slug: &str, display_name: &str, priority: u64) -> Value {
-    json!({
-        "id": slug,
-        "object": "model",
-        "created": 0,
-        "owned_by": "deepseek",
-        "model": slug,
-        "displayName": display_name,
-        "description": "DeepSeek model exposed through deepseek-responses-adapter.",
-        "defaultReasoningEffort": "high",
-        "supportedReasoningEfforts": [
-            {"reasoningEffort": "low", "description": "Mapped to DeepSeek high reasoning effort"},
-            {"reasoningEffort": "medium", "description": "Mapped to DeepSeek high reasoning effort"},
-            {"reasoningEffort": "high", "description": "DeepSeek high reasoning effort"},
-            {"reasoningEffort": "xhigh", "description": "Mapped to DeepSeek max reasoning effort"}
-        ],
-        "inputModalities": ["text"],
-        "supportsPersonality": false,
-        "additionalSpeedTiers": [],
-        "isDefault": priority == 0,
-        "hidden": false,
-        "priority": priority
-    })
-}
-
-fn reasoning_effort_for_deepseek(request: &Value) -> Option<&'static str> {
+fn resolve_reasoning_effort(request: &Value) -> Option<&'static str> {
     match request
         .get("reasoning")
         .and_then(|r| r.get("effort"))

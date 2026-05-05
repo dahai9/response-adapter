@@ -6,24 +6,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-
-const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
-const DEFAULT_MODEL: &str = "deepseek-v4-pro";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Backend {
-    DeepSeek,
-    OpenAICompatible,
-}
-
-impl Backend {
-    pub fn from_env() -> Self {
-        match env::var("ADAPTER_BACKEND").ok().as_deref() {
-            Some("openai") | Some("openai-compatible") => Self::OpenAICompatible,
-            _ => Self::DeepSeek,
-        }
-    }
-}
+use serde_json::Value;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -33,8 +16,8 @@ pub struct Config {
     pub model_override: Option<String>,
     pub thinking: Option<ThinkingMode>,
     pub timeout: Duration,
-    pub backend: Backend,
     pub listen: SocketAddr,
+    pub models: Vec<Value>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,22 +38,22 @@ impl ThinkingMode {
 impl Config {
     pub fn from_env() -> Result<Self> {
         load_dotenv(".env")?;
-        let api_key = env::var("DEEPSEEK_API_KEY").context("DEEPSEEK_API_KEY is not set")?;
+        let api_key = env::var("UPSTREAM_API_KEY").context("UPSTREAM_API_KEY is not set")?;
         let base_url =
-            non_empty_env("DEEPSEEK_BASE_URL").unwrap_or_else(|| DEFAULT_BASE_URL.into());
-        let model_override = non_empty_env("DEEPSEEK_MODEL");
-        let model_map = non_empty_env("DEEPSEEK_MODEL_MAP")
+            non_empty_env("UPSTREAM_BASE_URL").context("UPSTREAM_BASE_URL is not set")?;
+        let model_override = non_empty_env("ADAPTER_MODEL");
+        let model_map = non_empty_env("ADAPTER_MODEL_MAP")
             .and_then(|value| serde_json::from_str::<HashMap<String, String>>(&value).ok())
             .unwrap_or_default();
-        let thinking = match non_empty_env("DEEPSEEK_THINKING").as_deref() {
+        let thinking = match non_empty_env("ADAPTER_THINKING").as_deref() {
             Some("enabled") => Some(ThinkingMode::Enabled),
             Some("disabled") => Some(ThinkingMode::Disabled),
             Some(other) => {
-                anyhow::bail!("DEEPSEEK_THINKING must be enabled or disabled, got {other}")
+                anyhow::bail!("ADAPTER_THINKING must be enabled or disabled, got {other}")
             }
             None => None,
         };
-        let timeout = non_empty_env("DEEPSEEK_TIMEOUT")
+        let timeout = non_empty_env("ADAPTER_TIMEOUT")
             .and_then(|value| value.parse::<u64>().ok())
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(120));
@@ -78,10 +61,12 @@ impl Config {
         let port = non_empty_env("ADAPTER_PORT")
             .and_then(|value| value.parse::<u16>().ok())
             .unwrap_or(8787);
-        let backend = Backend::from_env();
         let listen = format!("{host}:{port}")
             .parse()
             .with_context(|| format!("invalid listen address {host}:{port}"))?;
+        let models = non_empty_env("ADAPTER_MODELS")
+            .and_then(|value| serde_json::from_str::<Vec<Value>>(&value).ok())
+            .unwrap_or_default();
 
         Ok(Self {
             api_key,
@@ -90,8 +75,8 @@ impl Config {
             model_override,
             thinking,
             timeout,
-            backend,
             listen,
+            models,
         })
     }
 
@@ -99,25 +84,18 @@ impl Config {
     ///
     /// Priority:
     /// 1. `model_map` match on the incoming model name
-    /// 2. `DEEPSEEK_MODEL` override (if set)
+    /// 2. `ADAPTER_MODEL` override (if set)
     /// 3. The incoming request's `model` field
-    /// 4. Default model
-    pub fn resolve_model(&self, request_model: Option<&str>) -> String {
-        // Try mapping first
+    pub fn resolve_model(&self, request_model: Option<&str>) -> Result<String> {
         if let Some(request_model) = request_model {
             if let Some(mapped) = self.model_map.get(request_model) {
-                return mapped.clone();
+                return Ok(mapped.clone());
             }
         }
-        // Then override, then request model, then default
         self.model_override
             .clone()
             .or_else(|| request_model.map(ToOwned::to_owned))
-            .unwrap_or_else(|| DEFAULT_MODEL.to_string())
-    }
-
-    pub fn default_model() -> &'static str {
-        DEFAULT_MODEL
+            .context("no model resolved: set ADAPTER_MODEL, ADAPTER_MODEL_MAP, or include model in the request")
     }
 }
 
@@ -174,7 +152,7 @@ fn unquote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, parse_dotenv};
+    use super::{parse_dotenv, Config};
     use std::collections::HashMap;
 
     #[test]
@@ -188,68 +166,67 @@ mod tests {
     #[test]
     fn resolve_model_uses_mapping() {
         let mut model_map = HashMap::new();
-        model_map.insert("gpt-5.4".into(), "deepseek-v4-flash".into());
-        model_map.insert("gpt-5.5".into(), "deepseek-v4-pro".into());
+        model_map.insert("gpt-5.4".into(), "model-a".into());
+        model_map.insert("gpt-5.5".into(), "model-b".into());
         let cfg = Config {
             api_key: "sk-test".into(),
-            base_url: "https://api.deepseek.com".into(),
+            base_url: "https://api.example.com".into(),
             model_map,
             model_override: None,
             thinking: None,
             timeout: std::time::Duration::from_secs(120),
-            backend: super::Backend::DeepSeek,
             listen: "127.0.0.1:8787".parse().unwrap(),
+            models: Vec::new(),
         };
-        assert_eq!(cfg.resolve_model(Some("gpt-5.4")), "deepseek-v4-flash");
-        assert_eq!(cfg.resolve_model(Some("gpt-5.5")), "deepseek-v4-pro");
+        assert_eq!(cfg.resolve_model(Some("gpt-5.4")).unwrap(), "model-a");
+        assert_eq!(cfg.resolve_model(Some("gpt-5.5")).unwrap(), "model-b");
     }
 
     #[test]
     fn resolve_model_falls_through_to_override() {
         let cfg = Config {
             api_key: "sk-test".into(),
-            base_url: "https://api.deepseek.com".into(),
+            base_url: "https://api.example.com".into(),
             model_map: HashMap::new(),
-            model_override: Some("deepseek-chat".into()),
+            model_override: Some("model-override".into()),
             thinking: None,
             timeout: std::time::Duration::from_secs(120),
-            backend: super::Backend::DeepSeek,
             listen: "127.0.0.1:8787".parse().unwrap(),
+            models: Vec::new(),
         };
-        // Override beats request model
-        assert_eq!(cfg.resolve_model(Some("gpt-5.5")), "deepseek-chat");
+        assert_eq!(
+            cfg.resolve_model(Some("gpt-5.5")).unwrap(),
+            "model-override"
+        );
     }
 
     #[test]
     fn resolve_model_falls_through_to_request_model() {
         let cfg = Config {
             api_key: "sk-test".into(),
-            base_url: "https://api.deepseek.com".into(),
+            base_url: "https://api.example.com".into(),
             model_map: HashMap::new(),
             model_override: None,
             thinking: None,
             timeout: std::time::Duration::from_secs(120),
-            backend: super::Backend::DeepSeek,
             listen: "127.0.0.1:8787".parse().unwrap(),
+            models: Vec::new(),
         };
-        assert_eq!(
-            cfg.resolve_model(Some("deepseek-chat")),
-            "deepseek-chat"
-        );
+        assert_eq!(cfg.resolve_model(Some("some-model")).unwrap(), "some-model");
     }
 
     #[test]
-    fn resolve_model_falls_through_to_default() {
+    fn resolve_model_errors_when_no_model_available() {
         let cfg = Config {
             api_key: "sk-test".into(),
-            base_url: "https://api.deepseek.com".into(),
+            base_url: "https://api.example.com".into(),
             model_map: HashMap::new(),
             model_override: None,
             thinking: None,
             timeout: std::time::Duration::from_secs(120),
-            backend: super::Backend::DeepSeek,
             listen: "127.0.0.1:8787".parse().unwrap(),
+            models: Vec::new(),
         };
-        assert_eq!(cfg.resolve_model(None), "deepseek-v4-pro");
+        assert!(cfg.resolve_model(None).is_err());
     }
 }

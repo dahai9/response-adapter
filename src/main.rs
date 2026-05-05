@@ -1,5 +1,5 @@
 use anyhow::Result;
-use deepseek_responses_adapter::config::Config;
+use responses_adapter::config::Config;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -8,5 +8,5 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Config::from_env()?;
-    deepseek_responses_adapter::server::run(config).await
+    responses_adapter::server::run(config).await
 }

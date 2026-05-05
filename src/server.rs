@@ -15,8 +15,8 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::adapter::{
-    build_deepseek_body, models_response, response_created, response_failed, response_id,
-    ReasoningStore, StreamingAccumulator,
+    build_chat_body, response_created, response_failed, response_id, ReasoningStore,
+    StreamingAccumulator,
 };
 use crate::config::Config;
 
@@ -48,7 +48,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let listen = config.listen;
     let app = router(config)?;
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    tracing::info!("deepseek-responses-adapter listening on http://{listen}");
+    tracing::info!("responses-adapter listening on http://{listen}");
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
@@ -61,21 +61,33 @@ async fn health() -> Json<Value> {
     Json(json!({"ok": true}))
 }
 
-async fn models() -> Json<Value> {
-    Json(models_response())
+async fn models(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "object": "list",
+        "data": state.config.models
+    }))
 }
 
 async fn responses(State(state): State<AppState>, Json(request): Json<Value>) -> Response {
     let resp_id = response_id();
     let converted = {
         let store = state.reasoning_store.lock().await;
-        build_deepseek_body(&request, &state.config, &store)
+        match build_chat_body(&request, &state.config, &store) {
+            Ok(converted) => converted,
+            Err(error) => {
+                let events = vec![
+                    response_created(&resp_id, None),
+                    response_failed(&resp_id, &error.to_string()),
+                ];
+                return sse_from_events(events).into_response();
+            }
+        }
     };
     if std::env::var("ADAPTER_DEBUG_BODY").ok().as_deref() == Some("1") {
         eprintln!("{}", converted.body);
     }
 
-    let upstream = match open_deepseek_stream(&state, &converted.body).await {
+    let upstream = match open_upstream_stream(&state, &converted.body).await {
         Ok(upstream) => upstream,
         Err(error) => {
             let events = vec![
@@ -136,7 +148,7 @@ async fn responses(State(state): State<AppState>, Json(request): Json<Value>) ->
         .into_response()
 }
 
-async fn open_deepseek_stream(
+async fn open_upstream_stream(
     state: &AppState,
     body: &Value,
 ) -> Result<impl Stream<Item = reqwest::Result<Bytes>>, AdapterHttpError> {
@@ -225,7 +237,7 @@ fn parse_sse_block(block: &str) -> anyhow::Result<Option<Value>> {
 enum AdapterHttpError {
     #[error(transparent)]
     Request(#[from] reqwest::Error),
-    #[error("DeepSeek HTTP {0}: {1}")]
+    #[error("Upstream HTTP {0}: {1}")]
     Upstream(StatusCode, String),
 }
 
