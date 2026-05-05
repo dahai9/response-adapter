@@ -2,7 +2,7 @@ use deepseek_responses_adapter::adapter::{
     build_deepseek_body, sanitize_chat_messages, ReasoningStore, StreamingAccumulator,
     ToolNameMapper,
 };
-use deepseek_responses_adapter::config::{Config, ThinkingMode};
+use deepseek_responses_adapter::config::{Backend, Config, ThinkingMode};
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::net::SocketAddr;
@@ -16,7 +16,40 @@ fn config(model_override: Option<&str>, thinking: Option<ThinkingMode>) -> Confi
         thinking,
         timeout: Duration::from_secs(120),
         listen: "127.0.0.1:8787".parse::<SocketAddr>().unwrap(),
+        backend: Backend::DeepSeek,
     }
+}
+
+#[test]
+fn converts_namespace_type_tools_to_flat_function_tools() {
+    let request = json!({
+        "model": "deepseek-v4-pro",
+        "instructions": "You are concise.",
+        "tools": [{
+            "type": "namespace",
+            "name": "jina-mcp-server",
+            "description": "Tools in the jina-mcp-server namespace.",
+            "tools": [{
+                "type": "function",
+                "name": "search",
+                "description": "Search the web",
+                "strict": false,
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}
+            }]
+        }],
+        "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}]
+    });
+
+    let converted = build_deepseek_body(&request, &config(None, None), &ReasoningStore::default());
+
+    assert_eq!(converted.body["model"], "deepseek-v4-pro");
+    assert_eq!(converted.body["messages"][0]["role"], "system");
+    assert_eq!(
+        converted.body["messages"][1],
+        json!( {"role": "user", "content": "hello"})
+    );
+    assert_eq!(converted.body["tools"][0]["function"]["name"], "jina_mcp_server__search");
+    assert_eq!(converted.body["tools"][0]["function"]["description"], "Search the web");
 }
 
 #[test]

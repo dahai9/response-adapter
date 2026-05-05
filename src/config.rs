@@ -10,6 +10,21 @@ use anyhow::{Context, Result};
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 const DEFAULT_MODEL: &str = "deepseek-v4-pro";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    DeepSeek,
+    OpenAICompatible,
+}
+
+impl Backend {
+    pub fn from_env() -> Self {
+        match env::var("ADAPTER_BACKEND").ok().as_deref() {
+            Some("openai") | Some("openai-compatible") => Self::OpenAICompatible,
+            _ => Self::DeepSeek,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub api_key: String,
@@ -17,6 +32,7 @@ pub struct Config {
     pub model_override: Option<String>,
     pub thinking: Option<ThinkingMode>,
     pub timeout: Duration,
+    pub backend: Backend,
     pub listen: SocketAddr,
 }
 
@@ -58,6 +74,7 @@ impl Config {
         let port = non_empty_env("ADAPTER_PORT")
             .and_then(|value| value.parse::<u16>().ok())
             .unwrap_or(8787);
+        let backend = Backend::from_env();
         let listen = format!("{host}:{port}")
             .parse()
             .with_context(|| format!("invalid listen address {host}:{port}"))?;
@@ -68,6 +85,7 @@ impl Config {
             model_override,
             thinking,
             timeout,
+            backend,
             listen,
         })
     }

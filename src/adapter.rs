@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 
-use crate::config::{Config, ThinkingMode};
+use crate::config::{Backend, Config, ThinkingMode};
 
 pub type JsonMap = Map<String, Value>;
 
@@ -107,7 +107,7 @@ pub fn build_deepseek_body(
 
     let tools = convert_tools(request.get("tools"), &mut mapper);
     let effort = reasoning_effort_for_deepseek(request);
-    let attach_reasoning = config.thinking == Some(ThinkingMode::Enabled) || effort.is_some();
+    let attach_reasoning = config.backend == Backend::DeepSeek && (config.thinking == Some(ThinkingMode::Enabled) || effort.is_some());
     messages.extend(convert_input(
         request.get("input"),
         &mut mapper,
@@ -144,12 +144,14 @@ pub fn build_deepseek_body(
         body["tool_choice"] = Value::String("auto".into());
     }
 
+    if config.backend == Backend::DeepSeek {
     if let Some(effort) = effort {
         body["reasoning_effort"] = Value::String(effort.into());
     }
 
     if config.thinking == Some(ThinkingMode::Enabled) {
         body["thinking"] = json!({"type": ThinkingMode::Enabled.as_str()});
+    }
     }
 
     ConvertedRequest { body, mapper }
@@ -164,6 +166,41 @@ pub fn convert_tools(tools: Option<&Value>, mapper: &mut ToolNameMapper) -> Vec<
         let Some(tool_type) = tool.get("type").and_then(Value::as_str) else {
             continue;
         };
+        // Handle namespace-type tools by flattening into individual function tools.
+        // The Responses API "namespace" type groups tools under a server/namespace name,
+        // but DeepSeek Chat Completions only supports flat function tools.
+        if tool_type == "namespace" {
+            let namespace_name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+            if let Some(Value::Array(inner_tools)) = tool.get("tools") {
+                for inner_tool in inner_tools {
+                    if inner_tool.get("type").and_then(Value::as_str) != Some("function") {
+                        continue;
+                    }
+                    let Some(name) = inner_tool.get("name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let encoded_name = mapper.add(name, Some(namespace_name));
+                    let description = inner_tool
+                        .get("description")
+                        .cloned()
+                        .unwrap_or_else(|| Value::String(String::new()));
+                    let parameters = inner_tool
+                        .get("parameters")
+                        .cloned()
+                        .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+                    out.push(json!({
+                        "type": "function",
+                        "function": {
+                            "name": encoded_name,
+                            "description": description,
+                            "parameters": parameters
+                        }
+                    }));
+                }
+            }
+            continue;
+        }
+
         if tool_type != "function" && tool.get("namespace").is_none() {
             continue;
         }
