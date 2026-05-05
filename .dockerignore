@@ -1,0 +1,6 @@
+target/
+.git/
+.env
+*.md
+.github/
+.gitignore

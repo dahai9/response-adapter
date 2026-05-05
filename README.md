@@ -1,54 +1,101 @@
 # responses-adapter
 
-Rust adapter that lets Codex use any OpenAI-compatible Chat Completions API
-when Codex is configured with `wire_api = "responses"`.
+[![CI](https://github.com/YOUR_USERNAME/responses-adapter/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR_USERNAME/responses-adapter/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-The adapter accepts:
+A lightweight Rust adapter that translates the OpenAI **Responses API** into
+standard **Chat Completions API** requests. This lets tools like Codex (which
+speak the Responses wire protocol) work with any OpenAI-compatible provider.
 
-```text
-POST /v1/responses
-```
-
-and forwards a translated streaming request to:
+## Architecture
 
 ```text
-POST {UPSTREAM_BASE_URL}/chat/completions
+Codex / Client                    responses-adapter                Upstream Provider
+    │                                    │                                │
+    │  POST /v1/responses                │                                │
+    │  (Responses API format)            │                                │
+    ├──────────────────────────────────►│                                │
+    │                                    │  POST /chat/completions        │
+    │                                    │  (Chat Completions format)     │
+    │                                    ├───────────────────────────────►│
+    │                                    │                                │
+    │                                    │  SSE stream (deltas)           │
+    │                                    │◄───────────────────────────────┤
+    │                                    │                                │
+    │  SSE stream                        │  (translated to Responses      │
+    │  (Responses events)                │   events: output_text.delta,   │
+    │◄──────────────────────────────────┤   function_call, etc.)         │
+    │                                    │                                │
 ```
 
-It then streams Responses-style SSE events back to Codex.
+## Quick Start
 
-## Run
+1. **Clone and configure:**
 
-Create `.env` in this directory:
+   ```bash
+   git clone https://github.com/YOUR_USERNAME/responses-adapter.git
+   cd responses-adapter
+   cp .env.example .env
+   # Edit .env with your API key and upstream URL
+   ```
+
+2. **Run:**
+
+   ```bash
+   cargo run
+   ```
+
+3. **Configure Codex** (`~/.codex/config.toml`):
+
+   ```toml
+   model = "gpt-4o"
+   model_provider = "responses-adapter"
+
+   [model_providers.responses-adapter]
+   name = "Responses Adapter"
+   base_url = "http://127.0.0.1:8787/v1"
+   wire_api = "responses"
+   env_key = "UPSTREAM_API_KEY"
+   ```
+
+## Building from Source
+
+**Prerequisites:** Rust 1.75+ (install via [rustup](https://rustup.rs/))
 
 ```bash
-UPSTREAM_API_KEY=sk-...
-UPSTREAM_BASE_URL=https://api.openai.com/v1
-ADAPTER_MODEL=gpt-4o
-ADAPTER_TIMEOUT=120
-ADAPTER_HOST=127.0.0.1
-ADAPTER_PORT=8787
+# Debug build
+cargo build
+
+# Release build (optimized)
+cargo build --release
+
+# Run tests
+cargo test
+
+# Lint
+cargo clippy -- -D warnings
+
+# Format check
+cargo fmt -- --check
 ```
 
-Start the adapter:
+## Docker
+
+Build and run with Docker:
 
 ```bash
-cargo run
+docker build -t responses-adapter .
+
+docker run -p 8787:8787 \
+  -e UPSTREAM_API_KEY=sk-your-key \
+  -e UPSTREAM_BASE_URL=https://api.openai.com/v1 \
+  responses-adapter
 ```
 
-## Codex Config
+Or with a `.env` file:
 
-Add this to `~/.codex/config.toml`:
-
-```toml
-model = "gpt-4o"
-model_provider = "responses-adapter"
-
-[model_providers.responses-adapter]
-name = "Responses Adapter"
-base_url = "http://127.0.0.1:8787/v1"
-wire_api = "responses"
-env_key = "UPSTREAM_API_KEY"
+```bash
+docker run -p 8787:8787 --env-file .env responses-adapter
 ```
 
 ## Environment Variables
@@ -64,43 +111,40 @@ env_key = "UPSTREAM_API_KEY"
 | `ADAPTER_HOST` | No | Listen host (default: 127.0.0.1) |
 | `ADAPTER_PORT` | No | Listen port (default: 8787) |
 | `ADAPTER_MODELS` | No | JSON array of model objects for the `/v1/models` endpoint |
-| `ADAPTER_DEBUG_BODY` | No | Set to `1` to print converted request body to stderr |
+| `ADAPTER_DEBUG_BODY` | No | Set to `1` to log converted request body (debug) |
+
+See [`.env.example`](.env.example) for a fully documented template.
+
+## API Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/v1/responses` | Translate Responses API request to Chat Completions |
+| `GET` | `/v1/models` | List configured models |
+| `GET` | `/health` | Health check |
 
 ## Translation Rules
 
 - Responses `instructions` becomes a Chat `system` message.
-- Responses `message` input becomes Chat `system`, `user`, or `assistant`
-  messages.
+- Responses `message` input becomes Chat `system`, `user`, or `assistant` messages.
 - Responses `function_call_output` becomes a Chat `tool` message.
 - Responses `function` tools become Chat `function` tools.
-- Namespaced tools are flattened into Chat-safe function names and decoded back
-  when streamed to Codex.
+- Namespaced tools are flattened into Chat-safe function names and decoded back when streamed.
 - Streamed `delta.content` becomes `response.output_text.delta`.
-- Streamed tool calls are accumulated and emitted as Responses `function_call`
-  items.
-- Assistant tool-call history is only forwarded when every `tool_call_id` has a
-  matching tool result, which avoids chat sequencing errors.
+- Streamed tool calls are accumulated and emitted as Responses `function_call` items.
+- Assistant tool-call history is only forwarded when every `tool_call_id` has a matching tool result.
 
 ## Thinking / Reasoning
 
-Codex has `model_reasoning_effort`; the adapter forwards that as
-`reasoning_effort` in the upstream request.
+Codex has `model_reasoning_effort`; the adapter forwards that as `reasoning_effort` in the upstream request.
 
-Some providers (e.g. DeepSeek) support a `thinking.enabled` protocol mode. In
-thinking mode with tool calls, the provider may require the assistant message's
-`reasoning_content` to be passed back during the same tool-call sub-turn. This
-adapter keeps an in-memory reasoning store keyed by tool call id and can replay
-that field for the tool-result continuation request.
+Some providers (e.g. DeepSeek) support a `thinking.enabled` protocol mode. In thinking mode with tool calls, the provider may require the assistant message's `reasoning_content` to be passed back during the same tool-call sub-turn. This adapter keeps an in-memory reasoning store keyed by tool call id and can replay that field for the tool-result continuation request.
 
-Enable it with:
+Enable with:
 
 ```bash
 ADAPTER_THINKING=enabled
 ```
-
-Leaving `ADAPTER_THINKING` unset is the safest default. If set to `disabled`,
-the adapter does not send the `thinking` field but remains compatible with
-`model_reasoning_effort`.
 
 ## Model Mapping
 
@@ -125,9 +169,15 @@ ADAPTER_MODELS='[{"id":"model-a","name":"Model A"},{"id":"model-b","name":"Model
 
 If not set, the endpoint returns an empty list.
 
-## Development
+## Contributing
 
-```bash
-cargo fmt
-cargo test
-```
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/my-change`)
+3. Make your changes and add tests
+4. Ensure `cargo fmt`, `cargo clippy`, and `cargo test` all pass
+5. Commit and push
+6. Open a Pull Request
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
