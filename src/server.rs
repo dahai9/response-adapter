@@ -70,11 +70,31 @@ async fn models(State(state): State<AppState>) -> Json<Value> {
 
 async fn responses(State(state): State<AppState>, Json(request): Json<Value>) -> Response {
     let resp_id = response_id();
+    let req_model = request.get("model").and_then(Value::as_str).unwrap_or("-");
+    let tools_count = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let input_count = request
+        .get("input")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    tracing::info!(
+        resp_id = %resp_id,
+        model = %req_model,
+        tools = tools_count,
+        inputs = input_count,
+        "incoming request"
+    );
+
     let converted = {
         let store = state.reasoning_store.lock().await;
         match build_chat_body(&request, &state.config, &store) {
             Ok(converted) => converted,
             Err(error) => {
+                tracing::error!(resp_id = %resp_id, error = %error, "failed to build chat body");
                 let events = vec![
                     response_created(&resp_id, None),
                     response_failed(&resp_id, &error.to_string()),
@@ -84,12 +104,19 @@ async fn responses(State(state): State<AppState>, Json(request): Json<Value>) ->
         }
     };
     if std::env::var("ADAPTER_DEBUG_BODY").ok().as_deref() == Some("1") {
-        eprintln!("{}", converted.body);
+        tracing::debug!(resp_id = %resp_id, body = %converted.body, "converted request body");
     }
+
+    let upstream_url = format!(
+        "{}/chat/completions",
+        state.config.base_url.trim_end_matches('/')
+    );
+    tracing::debug!(resp_id = %resp_id, url = %upstream_url, upstream_model = %converted.body["model"], "opening upstream stream");
 
     let upstream = match open_upstream_stream(&state, &converted.body).await {
         Ok(upstream) => upstream,
         Err(error) => {
+            tracing::error!(resp_id = %resp_id, error = %error, "upstream request failed");
             let events = vec![
                 response_created(&resp_id, None),
                 response_failed(&resp_id, &error.to_string()),
@@ -122,12 +149,14 @@ async fn responses(State(state): State<AppState>, Json(request): Json<Value>) ->
                             }
                         }
                         Err(error) => {
+                            tracing::error!(resp_id = %resp_id, error = %error, "SSE decode error");
                             yield event(response_failed(accumulator.resp_id().unwrap_or(&resp_id), &error.to_string()));
                             return;
                         }
                     }
                 }
                 Err(error) => {
+                    tracing::error!(resp_id = %resp_id, error = %error, "upstream stream error");
                     yield event(response_failed(accumulator.resp_id().unwrap_or(&resp_id), &error.to_string()));
                     return;
                 }
@@ -141,6 +170,7 @@ async fn responses(State(state): State<AppState>, Json(request): Json<Value>) ->
         for ev in accumulator.final_events(&mut store) {
             yield event(ev);
         }
+        tracing::info!(resp_id = %resp_id, "stream completed");
     };
 
     Sse::new(stream)
