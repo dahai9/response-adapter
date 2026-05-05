@@ -112,3 +112,42 @@ DeepSeek `thinking` field" so it remains compatible with Codex
 cargo fmt
 cargo test
 ```
+
+## Model Mapping
+
+The adapter supports mapping incoming model names to upstream DeepSeek models
+via `DEEPSEEK_MODEL_MAP`. This lets Codex use its built-in model names (e.g.
+`gpt-5.4`, `gpt-5.5`) while the adapter transparently routes to the correct
+DeepSeek model.
+
+```bash
+DEEPSEEK_MODEL_MAP='{"gpt-5.4":"deepseek-v4-flash","gpt-5.5":"deepseek-v4-pro"}'
+```
+
+**Resolution priority** (first match wins):
+1. `DEEPSEEK_MODEL_MAP` lookup on the incoming request's `model`
+2. `DEEPSEEK_MODEL` override (if set)
+3. The incoming request's `model` field as-is
+4. `deepseek-v4-pro` (default)
+
+If `DEEPSEEK_MODEL` is set, it acts as a fixed override that bypasses the map.
+For per-model routing, set `DEEPSEEK_MODEL_MAP` and leave `DEEPSEEK_MODEL`
+unset.
+
+### Example: Codex with model-aware routing
+
+```toml
+[model_providers.deepseek-responses-adapter]
+name = "DeepSeek Responses Adapter"
+base_url = "http://127.0.0.1:8787/v1"
+wire_api = "responses"
+```
+
+Then set in `.env`:
+
+```bash
+DEEPSEEK_MODEL_MAP={"gpt-5.4":"deepseek-v4-flash","gpt-5.5":"deepseek-v4-pro"}
+```
+
+Codex requests with `model = "gpt-5.4"` will hit `deepseek-v4-flash`, and
+requests with `model = "gpt-5.5"` will hit `deepseek-v4-pro`.

@@ -121,16 +121,11 @@ pub fn build_deepseek_body(
         messages
     };
 
-    let model = config
-        .model_override
-        .clone()
-        .or_else(|| {
-            request
-                .get("model")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-        .unwrap_or_else(|| Config::default_model().to_string());
+    let model = config.resolve_model(
+        request
+            .get("model")
+            .and_then(Value::as_str),
+    );
 
     let mut body = json!({
         "model": model,

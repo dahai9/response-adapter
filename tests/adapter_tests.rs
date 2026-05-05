@@ -7,11 +7,11 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::net::SocketAddr;
 use std::time::Duration;
-
 fn config(model_override: Option<&str>, thinking: Option<ThinkingMode>) -> Config {
     Config {
         api_key: "test-key".into(),
         base_url: "https://api.deepseek.com".into(),
+        model_map: std::collections::HashMap::new(),
         model_override: model_override.map(ToOwned::to_owned),
         thinking,
         timeout: Duration::from_secs(120),

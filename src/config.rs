@@ -29,6 +29,7 @@ impl Backend {
 pub struct Config {
     pub api_key: String,
     pub base_url: String,
+    pub model_map: HashMap<String, String>,
     pub model_override: Option<String>,
     pub thinking: Option<ThinkingMode>,
     pub timeout: Duration,
@@ -58,6 +59,9 @@ impl Config {
         let base_url =
             non_empty_env("DEEPSEEK_BASE_URL").unwrap_or_else(|| DEFAULT_BASE_URL.into());
         let model_override = non_empty_env("DEEPSEEK_MODEL");
+        let model_map = non_empty_env("DEEPSEEK_MODEL_MAP")
+            .and_then(|value| serde_json::from_str::<HashMap<String, String>>(&value).ok())
+            .unwrap_or_default();
         let thinking = match non_empty_env("DEEPSEEK_THINKING").as_deref() {
             Some("enabled") => Some(ThinkingMode::Enabled),
             Some("disabled") => Some(ThinkingMode::Disabled),
@@ -82,12 +86,34 @@ impl Config {
         Ok(Self {
             api_key,
             base_url,
+            model_map,
             model_override,
             thinking,
             timeout,
             backend,
             listen,
         })
+    }
+
+    /// Resolve the upstream model name from the incoming request model.
+    ///
+    /// Priority:
+    /// 1. `model_map` match on the incoming model name
+    /// 2. `DEEPSEEK_MODEL` override (if set)
+    /// 3. The incoming request's `model` field
+    /// 4. Default model
+    pub fn resolve_model(&self, request_model: Option<&str>) -> String {
+        // Try mapping first
+        if let Some(request_model) = request_model {
+            if let Some(mapped) = self.model_map.get(request_model) {
+                return mapped.clone();
+            }
+        }
+        // Then override, then request model, then default
+        self.model_override
+            .clone()
+            .or_else(|| request_model.map(ToOwned::to_owned))
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string())
     }
 
     pub fn default_model() -> &'static str {
@@ -148,7 +174,8 @@ fn unquote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_dotenv;
+    use super::{Config, parse_dotenv};
+    use std::collections::HashMap;
 
     #[test]
     fn parses_simple_dotenv() {
@@ -156,5 +183,73 @@ mod tests {
         assert_eq!(got.get("A").unwrap(), "1");
         assert_eq!(got.get("B").unwrap(), "two");
         assert_eq!(got.get("C").unwrap(), "three");
+    }
+
+    #[test]
+    fn resolve_model_uses_mapping() {
+        let mut model_map = HashMap::new();
+        model_map.insert("gpt-5.4".into(), "deepseek-v4-flash".into());
+        model_map.insert("gpt-5.5".into(), "deepseek-v4-pro".into());
+        let cfg = Config {
+            api_key: "sk-test".into(),
+            base_url: "https://api.deepseek.com".into(),
+            model_map,
+            model_override: None,
+            thinking: None,
+            timeout: std::time::Duration::from_secs(120),
+            backend: super::Backend::DeepSeek,
+            listen: "127.0.0.1:8787".parse().unwrap(),
+        };
+        assert_eq!(cfg.resolve_model(Some("gpt-5.4")), "deepseek-v4-flash");
+        assert_eq!(cfg.resolve_model(Some("gpt-5.5")), "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn resolve_model_falls_through_to_override() {
+        let cfg = Config {
+            api_key: "sk-test".into(),
+            base_url: "https://api.deepseek.com".into(),
+            model_map: HashMap::new(),
+            model_override: Some("deepseek-chat".into()),
+            thinking: None,
+            timeout: std::time::Duration::from_secs(120),
+            backend: super::Backend::DeepSeek,
+            listen: "127.0.0.1:8787".parse().unwrap(),
+        };
+        // Override beats request model
+        assert_eq!(cfg.resolve_model(Some("gpt-5.5")), "deepseek-chat");
+    }
+
+    #[test]
+    fn resolve_model_falls_through_to_request_model() {
+        let cfg = Config {
+            api_key: "sk-test".into(),
+            base_url: "https://api.deepseek.com".into(),
+            model_map: HashMap::new(),
+            model_override: None,
+            thinking: None,
+            timeout: std::time::Duration::from_secs(120),
+            backend: super::Backend::DeepSeek,
+            listen: "127.0.0.1:8787".parse().unwrap(),
+        };
+        assert_eq!(
+            cfg.resolve_model(Some("deepseek-chat")),
+            "deepseek-chat"
+        );
+    }
+
+    #[test]
+    fn resolve_model_falls_through_to_default() {
+        let cfg = Config {
+            api_key: "sk-test".into(),
+            base_url: "https://api.deepseek.com".into(),
+            model_map: HashMap::new(),
+            model_override: None,
+            thinking: None,
+            timeout: std::time::Duration::from_secs(120),
+            backend: super::Backend::DeepSeek,
+            listen: "127.0.0.1:8787".parse().unwrap(),
+        };
+        assert_eq!(cfg.resolve_model(None), "deepseek-v4-pro");
     }
 }
