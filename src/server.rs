@@ -28,7 +28,12 @@ pub struct AppState {
 }
 
 pub fn router(config: Config) -> anyhow::Result<Router> {
-    let client = reqwest::Client::builder().timeout(config.timeout).build()?;
+    let client = reqwest::Client::builder()
+        .timeout(config.timeout)
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .build()?;
     let state = AppState {
         config,
         client,
