@@ -155,6 +155,26 @@ pub fn convert_tools(tools: Option<&Value>, mapper: &mut ToolNameMapper) -> Vec<
         let Some(tool_type) = tool.get("type").and_then(Value::as_str) else {
             continue;
         };
+        if tool_type == "tool_search" {
+            let encoded_name = mapper.add("tool_search", None);
+            let description = tool
+                .get("description")
+                .cloned()
+                .unwrap_or_else(|| Value::String(String::new()));
+            let parameters = tool
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+            out.push(json!({
+                "type": "function",
+                "function": {
+                    "name": encoded_name,
+                    "description": description,
+                    "parameters": parameters
+                }
+            }));
+            continue;
+        }
         // Handle namespace-type tools by flattening into individual function tools.
         // The Responses API "namespace" type groups tools under a server/namespace name,
         // but Chat Completions only supports flat function tools.
@@ -251,6 +271,32 @@ pub fn convert_input(
                     out.push(message);
                 }
             }
+            "tool_search_call" => {
+                let encoded_name = mapper.add("tool_search", None);
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| item_id("call"));
+                let arguments = item
+                    .get("arguments")
+                    .map(arguments_to_string)
+                    .unwrap_or_else(|| "{}".into());
+                let mut message = json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": encoded_name, "arguments": arguments}
+                    }]
+                });
+                let reasoning = reasoning_store
+                    .reasoning_for_call(message["tool_calls"][0]["id"].as_str().unwrap_or_default())
+                    .unwrap_or_default();
+                message["reasoning_content"] = Value::String(reasoning.to_string());
+                out.push(message);
+            }
             "function_call" | "custom_tool_call" => {
                 let Some(name) = item.get("name").and_then(Value::as_str) else {
                     continue;
@@ -286,6 +332,27 @@ pub fn convert_input(
                     .unwrap_or_default();
                 message["reasoning_content"] = Value::String(reasoning.to_string());
                 out.push(message);
+            }
+            "tool_search_output" => {
+                let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let content = json!({
+                    "status": item
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("completed"),
+                    "execution": item
+                        .get("execution")
+                        .and_then(Value::as_str)
+                        .unwrap_or("client"),
+                    "tools": item
+                        .get("tools")
+                        .cloned()
+                        .unwrap_or_else(|| Value::Array(Vec::new()))
+                })
+                .to_string();
+                out.push(json!({"role": "tool", "tool_call_id": call_id, "content": content}));
             }
             "function_call_output" | "custom_tool_call_output" => {
                 let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
@@ -426,9 +493,28 @@ pub fn function_call_item(tool_call: &Value, mapper: &ToolNameMapper) -> Option<
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| "{}".into());
+    let call_id = tool_call
+        .get("id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| item_id("call"));
+    if namespace.is_none() && name == "tool_search" {
+        let arguments = serde_json::from_str::<Value>(&arguments)
+            .unwrap_or_else(|_| json!({"query": arguments}));
+        return Some(json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "tool_search_call",
+                "call_id": call_id,
+                "status": "completed",
+                "execution": "client",
+                "arguments": arguments
+            }
+        }));
+    }
     let mut item = json!({
         "type": "function_call",
-        "call_id": tool_call.get("id").and_then(Value::as_str).map(ToOwned::to_owned).unwrap_or_else(|| item_id("call")),
+        "call_id": call_id,
         "name": name,
         "arguments": arguments
     });
@@ -648,6 +734,13 @@ fn content_part_to_text(value: &Value) -> Option<String> {
     value.as_str().map(ToOwned::to_owned)
 }
 
+fn arguments_to_string(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
 fn encode_tool_name(namespace: Option<&str>, name: &str) -> String {
     let raw = match namespace {
         Some(namespace) if !namespace.is_empty() => format!("{namespace}__{name}"),
@@ -698,4 +791,97 @@ fn text_hash(text: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn convert_tools_exposes_tool_search_as_chat_function() {
+        let tools = json!([
+            {
+                "type": "tool_search",
+                "execution": "client",
+                "description": "Search deferred tools",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"}
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }
+            }
+        ]);
+        let mut mapper = ToolNameMapper::default();
+
+        let got = convert_tools(Some(&tools), &mut mapper);
+
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["type"], "function");
+        assert_eq!(got[0]["function"]["name"], "tool_search");
+        assert_eq!(got[0]["function"]["description"], "Search deferred tools");
+        assert_eq!(got[0]["function"]["parameters"]["required"][0], "query");
+    }
+
+    #[test]
+    fn function_call_item_restores_tool_search_call() {
+        let mut mapper = ToolNameMapper::default();
+        mapper.add("tool_search", None);
+        let tool_call = json!({
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "tool_search",
+                "arguments": "{\"query\":\"mcp files\",\"limit\":3}"
+            }
+        });
+
+        let got = function_call_item(&tool_call, &mapper).expect("tool_search call");
+
+        assert_eq!(got["type"], "response.output_item.done");
+        assert_eq!(got["item"]["type"], "tool_search_call");
+        assert_eq!(got["item"]["call_id"], "call_1");
+        assert_eq!(got["item"]["execution"], "client");
+        assert_eq!(got["item"]["arguments"]["query"], "mcp files");
+        assert_eq!(got["item"]["arguments"]["limit"], 3);
+    }
+
+    #[test]
+    fn convert_input_keeps_tool_search_history_pair() {
+        let input = json!([
+            {
+                "type": "tool_search_call",
+                "call_id": "call_1",
+                "status": "completed",
+                "execution": "client",
+                "arguments": {"query": "browser tools"}
+            },
+            {
+                "type": "tool_search_output",
+                "call_id": "call_1",
+                "status": "completed",
+                "execution": "client",
+                "tools": [{"type": "function", "name": "read_mcp_resource"}]
+            }
+        ]);
+        let mut mapper = ToolNameMapper::default();
+
+        let got = convert_input(Some(&input), &mut mapper, &ReasoningStore::default(), false);
+
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0]["role"], "assistant");
+        assert_eq!(got[0]["tool_calls"][0]["function"]["name"], "tool_search");
+        assert_eq!(
+            got[0]["tool_calls"][0]["function"]["arguments"],
+            "{\"query\":\"browser tools\"}"
+        );
+        assert_eq!(got[1]["role"], "tool");
+        assert_eq!(got[1]["tool_call_id"], "call_1");
+        assert!(got[1]["content"]
+            .as_str()
+            .expect("content")
+            .contains("read_mcp_resource"));
+    }
 }
