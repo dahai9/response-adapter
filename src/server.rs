@@ -10,7 +10,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
@@ -30,6 +30,7 @@ pub struct AppState {
 pub fn router(config: Config) -> anyhow::Result<Router> {
     let client = reqwest::Client::builder()
         .timeout(config.timeout)
+        .http1_only()
         .no_gzip()
         .no_brotli()
         .no_deflate()
@@ -157,6 +158,25 @@ async fn responses(State(state): State<AppState>, Json(request): Json<Value>) ->
                         }
                         Err(error) => {
                             tracing::error!(resp_id = %resp_id, error = %error, "SSE decode error");
+                            if accumulator.has_output_items() {
+                                let completed_resp_id = accumulator
+                                    .resp_id()
+                                    .map(ToOwned::to_owned)
+                                    .unwrap_or_else(|| resp_id.clone());
+                                tracing::warn!(
+                                    resp_id = %completed_resp_id,
+                                    error = %error,
+                                    "finalizing partial response after SSE decode error"
+                                );
+                                if !created_sent {
+                                    yield event(response_created(&completed_resp_id, None));
+                                }
+                                let mut store = store.lock().await;
+                                for ev in accumulator.final_events(&mut store) {
+                                    yield event(ev);
+                                }
+                                return;
+                            }
                             yield event(response_failed(accumulator.resp_id().unwrap_or(&resp_id), &error.to_string()));
                             return;
                         }
@@ -164,6 +184,25 @@ async fn responses(State(state): State<AppState>, Json(request): Json<Value>) ->
                 }
                 Err(error) => {
                     tracing::error!(resp_id = %resp_id, error = %error, "upstream stream error");
+                    if accumulator.has_output_items() {
+                        let completed_resp_id = accumulator
+                            .resp_id()
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_else(|| resp_id.clone());
+                        tracing::warn!(
+                            resp_id = %completed_resp_id,
+                            error = %error,
+                            "finalizing partial response after upstream stream error"
+                        );
+                        if !created_sent {
+                            yield event(response_created(&completed_resp_id, None));
+                        }
+                        let mut store = store.lock().await;
+                        for ev in accumulator.final_events(&mut store) {
+                            yield event(ev);
+                        }
+                        return;
+                    }
                     yield event(response_failed(accumulator.resp_id().unwrap_or(&resp_id), &error.to_string()));
                     return;
                 }
@@ -197,6 +236,8 @@ async fn open_upstream_stream(
         .client
         .post(url)
         .header(AUTHORIZATION, format!("Bearer {}", state.config.api_key))
+        .header(ACCEPT, "text/event-stream")
+        .header(ACCEPT_ENCODING, "identity")
         .header(CONTENT_TYPE, "application/json")
         .json(body)
         .send()
@@ -237,15 +278,25 @@ impl SseDecoder {
         self.buffer.push_str(&String::from_utf8_lossy(chunk));
         let mut values = Vec::new();
 
-        while let Some(index) = self.buffer.find("\n\n") {
+        while let Some((index, boundary_len)) = sse_boundary(&self.buffer) {
             let block = self.buffer[..index].to_string();
-            self.buffer.drain(..index + 2);
+            self.buffer.drain(..index + boundary_len);
             if let Some(value) = parse_sse_block(&block)? {
                 values.push(value);
             }
         }
 
         Ok(values)
+    }
+}
+
+fn sse_boundary(buffer: &str) -> Option<(usize, usize)> {
+    let lf = buffer.find("\n\n").map(|index| (index, 2));
+    let crlf = buffer.find("\r\n\r\n").map(|index| (index, 4));
+    match (lf, crlf) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(boundary), None) | (None, Some(boundary)) => Some(boundary),
+        (None, None) => None,
     }
 }
 
@@ -293,6 +344,16 @@ data: [DONE]
 
 "#,
             )
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["id"], "1");
+    }
+
+    #[test]
+    fn parses_crlf_sse_boundaries() {
+        let mut decoder = SseDecoder::default();
+        let got = decoder
+            .push(b"data: {\"id\":\"1\",\"choices\":[]}\r\n\r\ndata: [DONE]\r\n\r\n")
             .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0]["id"], "1");

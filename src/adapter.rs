@@ -642,6 +642,10 @@ impl StreamingAccumulator {
         self.model.as_deref()
     }
 
+    pub fn has_output_items(&self) -> bool {
+        !self.content.is_empty() || !self.tool_calls.is_empty()
+    }
+
     pub fn ingest(&mut self, chunk: &Value) -> Vec<Value> {
         if self.resp_id.is_none() {
             self.resp_id = chunk
