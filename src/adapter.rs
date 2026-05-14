@@ -887,7 +887,7 @@ fn custom_tool_description(tool: &Value) -> String {
 }
 
 fn custom_tool_bridge_instructions() -> &'static str {
-    "Some Responses freeform/custom tools are exposed to this Chat Completions backend as normal function tools with a single string argument named `input`. When a user asks you to edit files, call the available editing tool immediately instead of only saying that you will edit. For `apply_patch`, put the exact raw patch text in the `input` string argument. Do not run apply_patch through shell heredocs unless no apply_patch tool is available. Before changing an existing file, inspect its current contents and use `*** Update File:`. Use `*** Add File:` only when you know the path does not already exist. If an apply_patch call fails, fix the patch and call apply_patch again."
+    "Some Responses freeform/custom tools are exposed to this Chat Completions backend as normal function tools with a single string argument named `input`. Put the exact raw freeform tool input in `input`; do not wrap the freeform payload in another JSON object inside that string."
 }
 
 fn apply_patch_tool_description(tool: &Value) -> String {
@@ -900,19 +900,17 @@ fn apply_patch_tool_description(tool: &Value) -> String {
         description.push('.');
     }
     description.push_str(
-        "\nThis Responses freeform `apply_patch` tool is exposed through Chat Completions as a function because this backend has no native freeform tool support. The function has exactly one argument, `input`, and `input` must contain the complete raw patch text.",
-    );
-    description.push_str(
-        "\nPatch rules: start with `*** Begin Patch` and end with `*** End Patch`; use `*** Add File:` only for new paths; use `*** Update File:` for existing paths; use `*** Delete File:` only when deleting. If you need to rewrite an existing file, read or inspect the current file first and then send an update patch. Do not use Add File for a path that may already exist.",
-    );
-    description.push_str(
-        "\nIf apply_patch reports that a file already exists or cannot find the expected context, do not switch to shell heredocs and do not stop using this tool. Read the file, correct the patch, and call apply_patch again.",
+        "\nThis Responses freeform/custom tool is exposed through Chat Completions as a function. The function has exactly one argument named `input`; put the complete raw apply_patch patch text in `input`.",
     );
     if let Some(format) = tool.get("format").filter(|format| !format.is_null()) {
-        description.push_str("\nOriginal freeform format: ");
-        description.push_str(&format.to_string());
+        description.push_str("\nOriginal Responses freeform tool format:\n");
+        description.push_str(&pretty_json(format));
     }
     description
+}
+
+fn pretty_json(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
 fn apply_patch_output_needs_recovery_hint(content: &str) -> bool {

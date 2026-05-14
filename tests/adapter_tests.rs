@@ -84,14 +84,13 @@ fn converts_custom_apply_patch_tool_to_chat_function() {
     assert_eq!(tools[0]["type"], "function");
     assert_eq!(tools[0]["function"]["name"], "apply_patch");
     assert_eq!(tools[0]["function"]["parameters"]["required"][0], "input");
-    assert!(tools[0]["function"]["description"]
-        .as_str()
-        .unwrap()
-        .contains("use `*** Update File:` for existing paths"));
-    assert!(tools[0]["function"]["description"]
-        .as_str()
-        .unwrap()
-        .contains("call apply_patch again"));
+    let description = tools[0]["function"]["description"].as_str().unwrap();
+    assert!(description
+        .contains("Use the apply_patch tool to edit files.\nThis Responses freeform/custom tool"));
+    assert!(description.contains("\"type\": \"grammar\""));
+    assert!(description.contains("\"syntax\": \"lark\""));
+    assert!(description.contains("\"definition\": \"start: begin_patch hunk+ end_patch\""));
+    assert!(description.contains("complete raw apply_patch patch text"));
     assert!(converted.body["messages"][0]["content"]
         .as_str()
         .unwrap()
