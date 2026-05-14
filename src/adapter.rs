@@ -108,6 +108,12 @@ impl ToolNameMapper {
             .copied()
             .unwrap_or(ToolKind::Function)
     }
+
+    fn has_custom_tools(&self) -> bool {
+        self.kinds
+            .values()
+            .any(|kind| matches!(kind, ToolKind::Custom))
+    }
 }
 
 #[derive(Debug)]
@@ -132,6 +138,9 @@ pub fn build_chat_body(
     let tools = convert_tools(request.get("tools"), &mut mapper);
     let effort = resolve_reasoning_effort(request);
     let attach_reasoning = config.thinking == Some(ThinkingMode::Enabled) || effort.is_some();
+    if mapper.has_custom_tools() {
+        messages.push(json!({"role": "system", "content": custom_tool_bridge_instructions()}));
+    }
     messages.extend(convert_input(
         request.get("input"),
         &mut mapper,
@@ -310,16 +319,19 @@ pub fn convert_input(
         match kind {
             "message" => {
                 let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
-                if matches!(role, "system" | "user" | "assistant") {
-                    let content = content_to_text(item.get("content").unwrap_or(&Value::Null));
-                    let mut message = json!({"role": role, "content": content});
-                    if attach_reasoning && role == "assistant" {
-                        if let Some(reasoning) = reasoning_store.reasoning_for_text(&content) {
-                            message["reasoning_content"] = Value::String(reasoning.to_string());
-                        }
+                let role = match role {
+                    "developer" => "system",
+                    "system" | "user" | "assistant" => role,
+                    _ => continue,
+                };
+                let content = content_to_text(item.get("content").unwrap_or(&Value::Null));
+                let mut message = json!({"role": role, "content": content});
+                if attach_reasoning && role == "assistant" {
+                    if let Some(reasoning) = reasoning_store.reasoning_for_text(&content) {
+                        message["reasoning_content"] = Value::String(reasoning.to_string());
                     }
-                    out.push(message);
                 }
+                out.push(message);
             }
             "tool_search_call" => {
                 let encoded_name = mapper.add("tool_search", None);
@@ -530,18 +542,22 @@ pub fn response_failed(resp_id: &str, message: &str) -> Value {
 }
 
 pub fn assistant_message_item(text: &str) -> Value {
-    assistant_message_item_with_id(&item_id("msg"), text)
+    assistant_message_item_with_id(&item_id("msg"), text, None)
 }
 
-fn assistant_message_item_with_id(id: &str, text: &str) -> Value {
+fn assistant_message_item_with_id(id: &str, text: &str, phase: Option<&str>) -> Value {
+    let mut item = json!({
+        "type": "message",
+        "role": "assistant",
+        "id": id,
+        "content": [{"type": "output_text", "text": text}]
+    });
+    if let Some(phase) = phase {
+        item["phase"] = Value::String(phase.to_string());
+    }
     json!({
         "type": "response.output_item.done",
-        "item": {
-            "type": "message",
-            "role": "assistant",
-            "id": id,
-            "content": [{"type": "output_text", "text": text}]
-        }
+        "item": item
     })
 }
 
@@ -704,12 +720,13 @@ impl StreamingAccumulator {
         let resp_id = self.resp_id.clone().unwrap_or_else(response_id);
         let mut events = Vec::new();
         if !self.content.is_empty() {
-            store.remember_text_reasoning(&self.content, &self.reasoning_content);
             let id = self
                 .message_item_id
                 .get_or_insert_with(|| item_id("msg"))
                 .clone();
-            events.push(assistant_message_item_with_id(&id, &self.content));
+            let phase = (!self.tool_calls.is_empty()).then_some("commentary");
+            store.remember_text_reasoning(&self.content, &self.reasoning_content);
+            events.push(assistant_message_item_with_id(&id, &self.content, phase));
         }
 
         let mut call_ids = Vec::new();
@@ -857,6 +874,10 @@ fn custom_tool_description(tool: &Value) -> String {
         description.push_str(&format.to_string());
     }
     description
+}
+
+fn custom_tool_bridge_instructions() -> &'static str {
+    "Some Responses freeform/custom tools are exposed to this Chat Completions backend as normal function tools with a single string argument named `input`. When a user asks you to edit files, call the available editing tool immediately instead of only saying that you will edit. For `apply_patch`, put the exact raw patch text in the `input` string argument. Do not run apply_patch through shell heredocs unless no apply_patch tool is available."
 }
 
 fn custom_input_from_arguments(arguments: &str) -> String {

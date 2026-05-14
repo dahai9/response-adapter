@@ -88,6 +88,32 @@ fn converts_custom_apply_patch_tool_to_chat_function() {
         .as_str()
         .unwrap()
         .contains("custom/freeform"));
+    assert!(converted.body["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("single string argument named `input`"));
+    assert_eq!(converted.body["messages"][1]["role"], "user");
+}
+
+#[test]
+fn preserves_developer_messages_as_system_messages() {
+    let request = json!({
+        "model": "test-model",
+        "input": [
+            {"type": "message", "role": "developer", "content": "Always use tools for file edits."},
+            {"type": "message", "role": "user", "content": "edit file"}
+        ]
+    });
+
+    let converted =
+        build_chat_body(&request, &config(None, None), &ReasoningStore::default()).unwrap();
+
+    assert_eq!(converted.body["messages"][0]["role"], "system");
+    assert_eq!(
+        converted.body["messages"][0]["content"],
+        "Always use tools for file edits."
+    );
+    assert_eq!(converted.body["messages"][1]["role"], "user");
 }
 
 #[test]
@@ -371,5 +397,38 @@ fn valid_tool_delta_requests_follow_up_turn() {
 
     assert_eq!(done[0]["type"], "response.output_item.done");
     assert_eq!(done[0]["item"]["type"], "function_call");
+    assert_eq!(done.last().unwrap()["response"]["end_turn"], false);
+}
+
+#[test]
+fn text_before_tool_call_is_marked_as_commentary() {
+    let mut mapper = ToolNameMapper::default();
+    mapper.add("lookup", None);
+    let mut accumulator = StreamingAccumulator::new(mapper);
+    accumulator.ingest(&json!({
+        "id": "chatcmpl_1",
+        "model": "test-model",
+        "choices": [{
+            "delta": {
+                "content": "I will look that up.",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "arguments": "{}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    }));
+
+    let mut store = ReasoningStore::default();
+    let done = accumulator.final_events(&mut store);
+
+    assert_eq!(done[0]["type"], "response.output_item.done");
+    assert_eq!(done[0]["item"]["phase"], "commentary");
     assert_eq!(done.last().unwrap()["response"]["end_turn"], false);
 }
