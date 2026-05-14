@@ -1,6 +1,6 @@
 # responses-adapter
 
-[![CI](https://github.com/YOUR_USERNAME/responses-adapter/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR_USERNAME/responses-adapter/actions/workflows/ci.yml)
+[![CI](https://github.com/dahai9/response-adapter/actions/workflows/ci.yml/badge.svg)](https://github.com/dahai9/response-adapter/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A lightweight Rust adapter that translates the OpenAI **Responses API** into
@@ -33,8 +33,8 @@ Codex / Client                    responses-adapter                Upstream Prov
 1. **Clone and configure:**
 
    ```bash
-   git clone https://github.com/YOUR_USERNAME/responses-adapter.git
-   cd responses-adapter
+   git clone https://github.com/dahai9/response-adapter.git
+   cd response-adapter
    cp .env.example .env
    # Edit .env with your API key and upstream URL
    ```
@@ -71,6 +71,9 @@ cargo build --release
 
 # Run tests
 cargo test
+
+# Build optimized binary
+cargo build --release
 
 # Lint
 cargo clippy -- -D warnings
@@ -177,6 +180,13 @@ If not set, the endpoint returns an empty list.
 4. Ensure `cargo fmt`, `cargo clippy`, and `cargo test` all pass
 5. Commit and push
 6. Open a Pull Request
+
+## CI/CD
+
+Pull requests and pushes to `main` run rustfmt, clippy, tests, a release build,
+and a Docker image build. Pushing a tag like `vX.Y.Z` runs the same validation,
+checks that the tag matches `Cargo.toml`, builds release archives for Linux,
+macOS, and Windows, then publishes a GitHub Release.
 
 ## License
 
