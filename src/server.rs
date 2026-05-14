@@ -146,7 +146,9 @@ async fn responses(State(state): State<AppState>, Json(request): Json<Value>) ->
                                 let events = accumulator.ingest(&json_chunk);
                                 if !created_sent {
                                     created_sent = true;
-                                    yield event(response_created(accumulator.resp_id().unwrap_or(&resp_id), accumulator.model()));
+                                    // Do not synthesize OpenAI-Model from the mapped upstream model.
+                                    // Codex treats that header as a server-side reroute signal.
+                                    yield event(response_created(accumulator.resp_id().unwrap_or(&resp_id), None));
                                 }
                                 for ev in events {
                                     yield event(ev);
