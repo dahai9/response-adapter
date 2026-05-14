@@ -446,11 +446,17 @@ pub fn convert_input(
                 let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
                     continue;
                 };
-                let content = item
+                let mut content = item
                     .get("output")
                     .map(content_to_text)
                     .or_else(|| item.get("result").map(content_to_text))
                     .unwrap_or_default();
+                if item.get("type").and_then(Value::as_str) == Some("custom_tool_call_output")
+                    && item.get("name").and_then(Value::as_str) == Some("apply_patch")
+                    && apply_patch_output_needs_recovery_hint(&content)
+                {
+                    content.push_str("\n\nAdapter guidance: the apply_patch attempt failed. Do not abandon apply_patch or switch to shell heredocs. If the target file already exists, read the current file and retry with `*** Update File:`. Use `*** Add File:` only for paths that do not exist.");
+                }
                 out.push(json!({"role": "tool", "tool_call_id": call_id, "content": content}));
             }
             _ => {}
@@ -858,6 +864,10 @@ fn arguments_to_string(value: &Value) -> String {
 }
 
 fn custom_tool_description(tool: &Value) -> String {
+    if tool.get("name").and_then(Value::as_str) == Some("apply_patch") {
+        return apply_patch_tool_description(tool);
+    }
+
     let mut description = tool
         .get("description")
         .and_then(Value::as_str)
@@ -877,7 +887,43 @@ fn custom_tool_description(tool: &Value) -> String {
 }
 
 fn custom_tool_bridge_instructions() -> &'static str {
-    "Some Responses freeform/custom tools are exposed to this Chat Completions backend as normal function tools with a single string argument named `input`. When a user asks you to edit files, call the available editing tool immediately instead of only saying that you will edit. For `apply_patch`, put the exact raw patch text in the `input` string argument. Do not run apply_patch through shell heredocs unless no apply_patch tool is available."
+    "Some Responses freeform/custom tools are exposed to this Chat Completions backend as normal function tools with a single string argument named `input`. When a user asks you to edit files, call the available editing tool immediately instead of only saying that you will edit. For `apply_patch`, put the exact raw patch text in the `input` string argument. Do not run apply_patch through shell heredocs unless no apply_patch tool is available. Before changing an existing file, inspect its current contents and use `*** Update File:`. Use `*** Add File:` only when you know the path does not already exist. If an apply_patch call fails, fix the patch and call apply_patch again."
+}
+
+fn apply_patch_tool_description(tool: &Value) -> String {
+    let mut description = tool
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("Use the `apply_patch` tool to edit files.")
+        .to_string();
+    if !description.ends_with('.') {
+        description.push('.');
+    }
+    description.push_str(
+        "\nThis Responses freeform `apply_patch` tool is exposed through Chat Completions as a function because this backend has no native freeform tool support. The function has exactly one argument, `input`, and `input` must contain the complete raw patch text.",
+    );
+    description.push_str(
+        "\nPatch rules: start with `*** Begin Patch` and end with `*** End Patch`; use `*** Add File:` only for new paths; use `*** Update File:` for existing paths; use `*** Delete File:` only when deleting. If you need to rewrite an existing file, read or inspect the current file first and then send an update patch. Do not use Add File for a path that may already exist.",
+    );
+    description.push_str(
+        "\nIf apply_patch reports that a file already exists or cannot find the expected context, do not switch to shell heredocs and do not stop using this tool. Read the file, correct the patch, and call apply_patch again.",
+    );
+    if let Some(format) = tool.get("format").filter(|format| !format.is_null()) {
+        description.push_str("\nOriginal freeform format: ");
+        description.push_str(&format.to_string());
+    }
+    description
+}
+
+fn apply_patch_output_needs_recovery_hint(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    lower.contains("already exists")
+        || lower.contains("file exists")
+        || lower.contains("no such file")
+        || lower.contains("failed to find")
+        || lower.contains("expected")
+        || lower.contains("apply_patch verification failed")
+        || lower.contains("invalid patch")
 }
 
 fn custom_input_from_arguments(arguments: &str) -> String {

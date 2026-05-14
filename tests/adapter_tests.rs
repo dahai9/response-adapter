@@ -87,7 +87,11 @@ fn converts_custom_apply_patch_tool_to_chat_function() {
     assert!(tools[0]["function"]["description"]
         .as_str()
         .unwrap()
-        .contains("custom/freeform"));
+        .contains("use `*** Update File:` for existing paths"));
+    assert!(tools[0]["function"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("call apply_patch again"));
     assert!(converted.body["messages"][0]["content"]
         .as_str()
         .unwrap()
@@ -320,6 +324,36 @@ fn custom_tool_call_history_wraps_freeform_input() {
         "*** Begin Patch\n*** Add File: note.txt\n+ok\n*** End Patch\n"
     );
     assert_eq!(converted.body["messages"][1]["role"], "tool");
+}
+
+#[test]
+fn failed_apply_patch_output_adds_retry_guidance() {
+    let request = json!({
+        "model": "test-model",
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_1",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** Add File: note.txt\n+new\n*** End Patch\n"
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_1",
+                "name": "apply_patch",
+                "output": "error: file already exists"
+            }
+        ]
+    });
+
+    let converted =
+        build_chat_body(&request, &config(None, None), &ReasoningStore::default()).unwrap();
+
+    assert_eq!(converted.body["messages"][1]["role"], "tool");
+    let content = converted.body["messages"][1]["content"].as_str().unwrap();
+    assert!(content.contains("file already exists"));
+    assert!(content.contains("retry with `*** Update File:`"));
+    assert!(content.contains("Do not abandon apply_patch"));
 }
 
 #[test]
