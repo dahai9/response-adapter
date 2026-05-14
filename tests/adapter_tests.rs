@@ -60,6 +60,37 @@ fn converts_namespace_type_tools_to_flat_function_tools() {
 }
 
 #[test]
+fn converts_custom_apply_patch_tool_to_chat_function() {
+    let request = json!({
+        "model": "test-model",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Use the apply_patch tool to edit files.",
+            "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": "start: begin_patch hunk+ end_patch"
+            }
+        }],
+        "input": [{"type": "message", "role": "user", "content": "edit file"}]
+    });
+
+    let converted =
+        build_chat_body(&request, &config(None, None), &ReasoningStore::default()).unwrap();
+    let tools = converted.body["tools"].as_array().unwrap();
+
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["type"], "function");
+    assert_eq!(tools[0]["function"]["name"], "apply_patch");
+    assert_eq!(tools[0]["function"]["parameters"]["required"][0], "input");
+    assert!(tools[0]["function"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("custom/freeform"));
+}
+
+#[test]
 fn maps_messages_tools_and_reasoning_effort() {
     let request = json!({
         "model": "test-model",
@@ -229,6 +260,43 @@ fn tool_call_history_always_carries_reasoning_content_field() {
 }
 
 #[test]
+fn custom_tool_call_history_wraps_freeform_input() {
+    let request = json!({
+        "model": "test-model",
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_1",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** Add File: note.txt\n+ok\n*** End Patch\n"
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_1",
+                "output": "Done"
+            }
+        ]
+    });
+
+    let converted =
+        build_chat_body(&request, &config(None, None), &ReasoningStore::default()).unwrap();
+    let message = &converted.body["messages"][0];
+
+    assert_eq!(message["tool_calls"][0]["function"]["name"], "apply_patch");
+    let args: serde_json::Value = serde_json::from_str(
+        message["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        args["input"],
+        "*** Begin Patch\n*** Add File: note.txt\n+ok\n*** End Patch\n"
+    );
+    assert_eq!(converted.body["messages"][1]["role"], "tool");
+}
+
+#[test]
 fn mapper_round_trips_namespace() {
     let mut mapper = ToolNameMapper::default();
     let encoded = mapper.add("run", Some("mcp/server"));
@@ -258,4 +326,50 @@ fn streaming_text_starts_item_before_delta() {
     let done = accumulator.final_events(&mut store);
     assert_eq!(done[0]["type"], "response.output_item.done");
     assert_eq!(done[0]["item"]["id"], events[0]["item"]["id"]);
+}
+
+#[test]
+fn finish_reason_tool_calls_without_tool_delta_still_ends_turn() {
+    let mut accumulator = StreamingAccumulator::new(ToolNameMapper::default());
+    accumulator.ingest(&json!({
+        "id": "chatcmpl_1",
+        "model": "test-model",
+        "choices": [{
+            "delta": {"content": "Now let me write the document."},
+            "finish_reason": "tool_calls"
+        }]
+    }));
+
+    let mut store = ReasoningStore::default();
+    let done = accumulator.final_events(&mut store);
+
+    assert_eq!(done.last().unwrap()["type"], "response.completed");
+    assert_eq!(done.last().unwrap()["response"]["end_turn"], true);
+}
+
+#[test]
+fn valid_tool_delta_requests_follow_up_turn() {
+    let mut accumulator = StreamingAccumulator::new(ToolNameMapper::default());
+    accumulator.ingest(&json!({
+        "id": "chatcmpl_1",
+        "model": "test-model",
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"}
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    }));
+
+    let mut store = ReasoningStore::default();
+    let done = accumulator.final_events(&mut store);
+
+    assert_eq!(done[0]["type"], "response.output_item.done");
+    assert_eq!(done[0]["item"]["type"], "function_call");
+    assert_eq!(done.last().unwrap()["response"]["end_turn"], false);
 }

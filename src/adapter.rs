@@ -49,15 +49,31 @@ impl ReasoningStore {
 pub struct ToolNameMapper {
     forward: HashMap<String, String>,
     reverse: HashMap<String, (Option<String>, String)>,
+    kinds: HashMap<String, ToolKind>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ToolKind {
+    Function,
+    Custom,
 }
 
 impl ToolNameMapper {
     pub fn add(&mut self, name: &str, namespace: Option<&str>) -> String {
+        self.add_with_kind(name, namespace, ToolKind::Function)
+    }
+
+    fn add_custom(&mut self, name: &str) -> String {
+        self.add_with_kind(name, None, ToolKind::Custom)
+    }
+
+    fn add_with_kind(&mut self, name: &str, namespace: Option<&str>, kind: ToolKind) -> String {
         let key = match namespace {
             Some(namespace) if !namespace.is_empty() => format!("{namespace}/{name}"),
             _ => name.to_string(),
         };
         if let Some(encoded) = self.forward.get(&key) {
+            self.kinds.entry(encoded.clone()).or_insert(kind);
             return encoded.clone();
         }
         let base = encode_tool_name(namespace, name);
@@ -75,6 +91,7 @@ impl ToolNameMapper {
                 name.to_string(),
             ),
         );
+        self.kinds.insert(encoded.clone(), kind);
         encoded
     }
 
@@ -83,6 +100,13 @@ impl ToolNameMapper {
             .get(encoded)
             .cloned()
             .unwrap_or_else(|| (None, encoded.to_string()))
+    }
+
+    fn kind(&self, encoded: &str) -> ToolKind {
+        self.kinds
+            .get(encoded)
+            .copied()
+            .unwrap_or(ToolKind::Function)
     }
 }
 
@@ -171,6 +195,32 @@ pub fn convert_tools(tools: Option<&Value>, mapper: &mut ToolNameMapper) -> Vec<
                     "name": encoded_name,
                     "description": description,
                     "parameters": parameters
+                }
+            }));
+            continue;
+        }
+        if tool_type == "custom" {
+            let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let encoded_name = mapper.add_custom(name);
+            let description = custom_tool_description(tool);
+            out.push(json!({
+                "type": "function",
+                "function": {
+                    "name": encoded_name,
+                    "description": description,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "input": {
+                                "type": "string",
+                                "description": "Raw freeform input for this tool."
+                            }
+                        },
+                        "required": ["input"],
+                        "additionalProperties": false
+                    }
                 }
             }));
             continue;
@@ -297,7 +347,38 @@ pub fn convert_input(
                 message["reasoning_content"] = Value::String(reasoning.to_string());
                 out.push(message);
             }
-            "function_call" | "custom_tool_call" => {
+            "custom_tool_call" => {
+                let Some(name) = item.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let encoded_name = mapper.add_custom(name);
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| item_id("call"));
+                let input = item
+                    .get("input")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| "{}".into());
+                let arguments = json!({"input": input}).to_string();
+                let mut message = json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": encoded_name, "arguments": arguments}
+                    }]
+                });
+                let reasoning = reasoning_store
+                    .reasoning_for_call(message["tool_calls"][0]["id"].as_str().unwrap_or_default())
+                    .unwrap_or_default();
+                message["reasoning_content"] = Value::String(reasoning.to_string());
+                out.push(message);
+            }
+            "function_call" => {
                 let Some(name) = item.get("name").and_then(Value::as_str) else {
                     continue;
                 };
@@ -312,11 +393,6 @@ pub fn convert_input(
                     .get("arguments")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned)
-                    .or_else(|| {
-                        item.get("input")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned)
-                    })
                     .unwrap_or_else(|| "{}".into());
                 let mut message = json!({
                     "role": "assistant",
@@ -498,6 +574,19 @@ pub fn function_call_item(tool_call: &Value, mapper: &ToolNameMapper) -> Option<
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| item_id("call"));
+    if namespace.is_none() && mapper.kind(encoded_name) == ToolKind::Custom {
+        let input = custom_input_from_arguments(&arguments);
+        return Some(json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "custom_tool_call",
+                "call_id": call_id,
+                "status": "completed",
+                "name": name,
+                "input": input
+            }
+        }));
+    }
     if namespace.is_none() && name == "tool_search" {
         let arguments = serde_json::from_str::<Value>(&arguments)
             .unwrap_or_else(|_| json!({"query": arguments}));
@@ -620,6 +709,7 @@ impl StreamingAccumulator {
         }
 
         let mut call_ids = Vec::new();
+        let mut emitted_tool_call = false;
         let mut indexes = self.tool_calls.keys().copied().collect::<Vec<_>>();
         indexes.sort_unstable();
         for index in indexes {
@@ -629,12 +719,17 @@ impl StreamingAccumulator {
                 }
                 if let Some(event) = function_call_item(tool_call, &self.mapper) {
                     events.push(event);
+                    emitted_tool_call = true;
                 }
             }
         }
         store.remember_tool_reasoning(call_ids, &self.reasoning_content);
 
-        let end_turn = self.finish_reason.as_deref() != Some("tool_calls");
+        // Some OpenAI-compatible providers emit finish_reason="tool_calls" even
+        // when the streamed delta contains only text or an incomplete tool call.
+        // Codex treats end_turn=false as "continue sampling", so only request a
+        // follow-up when we actually produced a callable Responses tool item.
+        let end_turn = !emitted_tool_call;
         events.push(response_completed(&resp_id, self.usage.clone(), end_turn));
         events
     }
@@ -739,6 +834,36 @@ fn arguments_to_string(value: &Value) -> String {
         Value::String(text) => text.clone(),
         other => other.to_string(),
     }
+}
+
+fn custom_tool_description(tool: &Value) -> String {
+    let mut description = tool
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if !description.is_empty() {
+        description.push('\n');
+    }
+    description.push_str(
+        "This Responses custom/freeform tool is exposed through Chat Completions as a function. Put the exact raw tool input in the `input` string argument.",
+    );
+    if let Some(format) = tool.get("format").filter(|format| !format.is_null()) {
+        description.push_str("\nOriginal freeform format: ");
+        description.push_str(&format.to_string());
+    }
+    description
+}
+
+fn custom_input_from_arguments(arguments: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(arguments) else {
+        return arguments.to_string();
+    };
+    value
+        .get("input")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| arguments.to_string())
 }
 
 fn encode_tool_name(namespace: Option<&str>, name: &str) -> String {
@@ -846,6 +971,28 @@ mod tests {
         assert_eq!(got["item"]["execution"], "client");
         assert_eq!(got["item"]["arguments"]["query"], "mcp files");
         assert_eq!(got["item"]["arguments"]["limit"], 3);
+    }
+
+    #[test]
+    fn function_call_item_restores_custom_tool_call() {
+        let mut mapper = ToolNameMapper::default();
+        mapper.add_custom("apply_patch");
+        let tool_call = json!({
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "apply_patch",
+                "arguments": "{\"input\":\"*** Begin Patch\\n*** End Patch\\n\"}"
+            }
+        });
+
+        let got = function_call_item(&tool_call, &mapper).expect("custom tool call");
+
+        assert_eq!(got["type"], "response.output_item.done");
+        assert_eq!(got["item"]["type"], "custom_tool_call");
+        assert_eq!(got["item"]["call_id"], "call_1");
+        assert_eq!(got["item"]["name"], "apply_patch");
+        assert_eq!(got["item"]["input"], "*** Begin Patch\n*** End Patch\n");
     }
 
     #[test]
