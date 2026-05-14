@@ -42,13 +42,18 @@ fn converts_namespace_type_tools_to_flat_function_tools() {
 
     let converted =
         build_chat_body(&request, &config(None, None), &ReasoningStore::default()).unwrap();
+    let messages = converted.body["messages"].as_array().unwrap();
 
     assert_eq!(converted.body["model"], "test-model");
-    assert_eq!(converted.body["messages"][0]["role"], "system");
-    assert_eq!(
-        converted.body["messages"][1],
-        json!( {"role": "user", "content": "hello"})
-    );
+    assert_eq!(messages[0]["role"], "system");
+    assert!(messages
+        .iter()
+        .any(|message| message == &json!({"role": "user", "content": "hello"})));
+    assert!(messages.iter().any(|message| message["role"] == "system"
+        && message["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("do not end your turn immediately after a status update")));
     assert_eq!(
         converted.body["tools"][0]["function"]["name"],
         "jina_mcp_server__search"
@@ -102,7 +107,11 @@ fn converts_custom_apply_patch_tool_to_chat_function() {
         .as_str()
         .unwrap()
         .contains("single string argument named `input`"));
-    assert_eq!(converted.body["messages"][1]["role"], "user");
+    assert!(converted.body["messages"][1]["content"]
+        .as_str()
+        .unwrap()
+        .contains("do not end your turn immediately after a status update"));
+    assert_eq!(converted.body["messages"][2]["role"], "user");
 }
 
 #[test]
@@ -148,14 +157,19 @@ fn maps_messages_tools_and_reasoning_effort() {
 
     let converted =
         build_chat_body(&request, &config(None, None), &ReasoningStore::default()).unwrap();
+    let messages = converted.body["messages"].as_array().unwrap();
 
     assert_eq!(converted.body["model"], "test-model");
     assert_eq!(converted.body["reasoning_effort"], "max");
-    assert_eq!(converted.body["messages"][0]["role"], "system");
-    assert_eq!(
-        converted.body["messages"][1],
-        json!({"role": "user", "content": "hello"})
-    );
+    assert_eq!(messages[0]["role"], "system");
+    assert!(messages
+        .iter()
+        .any(|message| message == &json!({"role": "user", "content": "hello"})));
+    assert!(messages.iter().any(|message| message["role"] == "system"
+        && message["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("do not end your turn immediately after a status update")));
     assert_eq!(
         converted.body["tools"][0]["function"]["name"],
         "mcp_server__lookup"
@@ -488,6 +502,47 @@ fn work_preamble_without_tool_call_requests_follow_up_turn() {
     assert_eq!(done[0]["type"], "response.output_item.done");
     assert_eq!(done[0]["item"]["phase"], "commentary");
     assert_eq!(done.last().unwrap()["type"], "response.completed");
+    assert_eq!(done.last().unwrap()["response"]["end_turn"], false);
+}
+
+#[test]
+fn multiline_summary_with_final_work_preamble_requests_follow_up_turn() {
+    let mut accumulator = StreamingAccumulator::new(ToolNameMapper::default());
+    accumulator.ingest(&json!({
+        "id": "chatcmpl_1",
+        "model": "test-model",
+        "choices": [{
+            "delta": {
+                "content": "Evaluation summary:\n- strong technical value\n\nThis passes the threshold. Writing the blog now."
+            },
+            "finish_reason": "stop"
+        }]
+    }));
+
+    let mut store = ReasoningStore::default();
+    let done = accumulator.final_events(&mut store);
+
+    assert_eq!(done[0]["type"], "response.output_item.done");
+    assert_eq!(done[0]["item"]["phase"], "commentary");
+    assert_eq!(done.last().unwrap()["response"]["end_turn"], false);
+}
+
+#[test]
+fn apology_then_continue_work_requests_follow_up_turn() {
+    let mut accumulator = StreamingAccumulator::new(ToolNameMapper::default());
+    accumulator.ingest(&json!({
+        "id": "chatcmpl_1",
+        "model": "test-model",
+        "choices": [{
+            "delta": {"content": "抱歉，继续写博客。"},
+            "finish_reason": "stop"
+        }]
+    }));
+
+    let mut store = ReasoningStore::default();
+    let done = accumulator.final_events(&mut store);
+
+    assert_eq!(done[0]["item"]["phase"], "commentary");
     assert_eq!(done.last().unwrap()["response"]["end_turn"], false);
 }
 

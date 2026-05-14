@@ -141,6 +141,9 @@ pub fn build_chat_body(
     if mapper.has_custom_tools() {
         messages.push(json!({"role": "system", "content": custom_tool_bridge_instructions()}));
     }
+    if !tools.is_empty() {
+        messages.push(json!({"role": "system", "content": tool_turn_continuity_instructions()}));
+    }
     messages.extend(convert_input(
         request.get("input"),
         &mut mapper,
@@ -967,6 +970,10 @@ fn custom_tool_bridge_instructions() -> &'static str {
     "Some Responses freeform/custom tools are exposed to this Chat Completions backend as normal function tools with a single string argument named `input`. Put the exact raw freeform tool input in `input`; do not wrap the freeform payload in another JSON object inside that string."
 }
 
+fn tool_turn_continuity_instructions() -> &'static str {
+    "When you decide to inspect, edit, verify, or otherwise continue working with tools, do not end your turn immediately after a status update or intent announcement. Avoid stopping after phrases like 'I will...', 'Let me...', 'Writing ... now', '开始...', or '继续...'. In the same turn, either make the next tool call immediately or continue directly until you can produce a concrete result."
+}
+
 fn apply_patch_tool_description(tool: &Value) -> String {
     let mut description = tool
         .get("description")
@@ -1060,6 +1067,30 @@ fn assistant_text_is_work_preamble(text: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
+
+    let mut segments = vec![trimmed.to_string()];
+    if let Some(last_line) = trimmed.lines().rev().find(|line| !line.trim().is_empty()) {
+        let last_line = last_line.trim();
+        if !last_line.is_empty() && last_line != trimmed {
+            segments.push(last_line.to_string());
+        }
+    }
+    if let Some(last_sentence) = last_sentence(trimmed) {
+        if !last_sentence.is_empty() && !segments.iter().any(|segment| segment == &last_sentence) {
+            segments.push(last_sentence);
+        }
+    }
+
+    segments
+        .iter()
+        .any(|segment| segment_is_work_preamble(segment))
+}
+
+fn segment_is_work_preamble(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
     let lower = trimmed.to_ascii_lowercase();
     let starts_like_preamble = [
         "now i'll",
@@ -1069,26 +1100,58 @@ fn assistant_text_is_work_preamble(text: &str) -> bool {
         "let me",
         "i'm going to",
         "i am going to",
+        "writing",
+        "rewriting",
+        "creating",
+        "updating",
+        "editing",
+        "implementing",
+        "fixing",
+        "testing",
+        "optimizing",
+        "improving",
     ]
     .iter()
     .any(|prefix| lower.starts_with(prefix))
-        || ["开始", "现在", "接下来", "继续", "我会", "我将", "先"]
-            .iter()
-            .any(|prefix| trimmed.starts_with(prefix));
+        || [
+            "开始",
+            "现在",
+            "接下来",
+            "继续",
+            "我会",
+            "我将",
+            "先",
+            "正在",
+            "下面",
+        ]
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix));
     if !starts_like_preamble {
         return false;
     }
 
     [
         "rewrite",
+        "rewriting",
         "write",
+        "writing",
         "create",
+        "creating",
         "update",
+        "updating",
         "edit",
+        "editing",
         "implement",
+        "implementing",
         "fix",
+        "fixing",
         "verify",
         "test",
+        "testing",
+        "optimize",
+        "optimizing",
+        "improve",
+        "improving",
         "重写",
         "写",
         "创建",
@@ -1105,6 +1168,17 @@ fn assistant_text_is_work_preamble(text: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle) || trimmed.contains(needle))
+}
+
+fn last_sentence(text: &str) -> Option<String> {
+    let mut parts = text
+        .split([
+            '\n', '.', '!', '?', '。', '！', '？', ',', '，', ';', '；', ':', '：',
+        ])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    parts.pop().map(ToOwned::to_owned)
 }
 
 pub fn response_id() -> String {
