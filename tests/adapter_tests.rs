@@ -14,7 +14,7 @@ fn config(model_override: Option<&str>, thinking: Option<ThinkingMode>) -> Confi
         model_map: std::collections::HashMap::new(),
         model_override: model_override.map(ToOwned::to_owned),
         thinking,
-        timeout: Duration::from_secs(120),
+        connect_timeout: Duration::from_secs(120),
         listen: "127.0.0.1:8787".parse::<SocketAddr>().unwrap(),
         models: Vec::new(),
     }
@@ -91,6 +91,13 @@ fn converts_custom_apply_patch_tool_to_chat_function() {
     assert!(description.contains("\"syntax\": \"lark\""));
     assert!(description.contains("\"definition\": \"start: begin_patch hunk+ end_patch\""));
     assert!(description.contains("complete raw apply_patch patch text"));
+    assert!(description.contains("Apply patch usage rules:"));
+    assert!(description.contains("final line must be exactly `*** End Patch`"));
+    assert!(description.contains("Use `*** Update File: path` for existing files"));
+    assert!(description.contains("include enough unchanged context lines"));
+    assert!(description.contains("split the work into multiple smaller"));
+    assert!(description.contains("Do not use shell heredocs"));
+    assert!(description.contains("*** Begin Patch\n*** Update File: path/to/file.py"));
     assert!(converted.body["messages"][0]["content"]
         .as_str()
         .unwrap()
@@ -356,6 +363,63 @@ fn failed_apply_patch_output_adds_retry_guidance() {
 }
 
 #[test]
+fn failed_apply_patch_output_without_name_uses_call_history_for_guidance() {
+    let request = json!({
+        "model": "test-model",
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_1",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** Update File: note.txt\n@@\n-old\n+new\n"
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_1",
+                "output": "apply_patch verification failed: invalid patch: The last line of the patch must be '*** End Patch'"
+            }
+        ]
+    });
+
+    let converted =
+        build_chat_body(&request, &config(None, None), &ReasoningStore::default()).unwrap();
+
+    assert_eq!(converted.body["messages"][1]["role"], "tool");
+    let content = converted.body["messages"][1]["content"].as_str().unwrap();
+    assert!(content.contains("invalid patch"));
+    assert!(content.contains("Do not abandon apply_patch"));
+    assert!(content.contains("Retry with apply_patch"));
+    assert!(content.contains("final line is exactly `*** End Patch`"));
+    assert!(content.contains("split the edit into a smaller patch"));
+}
+
+#[test]
+fn failed_non_apply_patch_custom_output_without_name_does_not_add_patch_guidance() {
+    let request = json!({
+        "model": "test-model",
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_1",
+                "name": "other_tool",
+                "input": "payload"
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_1",
+                "output": "invalid patch"
+            }
+        ]
+    });
+
+    let converted =
+        build_chat_body(&request, &config(None, None), &ReasoningStore::default()).unwrap();
+
+    let content = converted.body["messages"][1]["content"].as_str().unwrap();
+    assert_eq!(content, "invalid patch");
+}
+
+#[test]
 fn mapper_round_trips_namespace() {
     let mut mapper = ToolNameMapper::default();
     let encoded = mapper.add("run", Some("mcp/server"));
@@ -396,6 +460,46 @@ fn finish_reason_tool_calls_without_tool_delta_still_ends_turn() {
         "choices": [{
             "delta": {"content": "Now let me write the document."},
             "finish_reason": "tool_calls"
+        }]
+    }));
+
+    let mut store = ReasoningStore::default();
+    let done = accumulator.final_events(&mut store);
+
+    assert_eq!(done.last().unwrap()["type"], "response.completed");
+    assert_eq!(done.last().unwrap()["response"]["end_turn"], true);
+}
+
+#[test]
+fn work_preamble_without_tool_call_requests_follow_up_turn() {
+    let mut accumulator = StreamingAccumulator::new(ToolNameMapper::default());
+    accumulator.ingest(&json!({
+        "id": "chatcmpl_1",
+        "model": "test-model",
+        "choices": [{
+            "delta": {"content": "开始第二轮优化。这次聚焦：按键连发、死局检测。"},
+            "finish_reason": "stop"
+        }]
+    }));
+
+    let mut store = ReasoningStore::default();
+    let done = accumulator.final_events(&mut store);
+
+    assert_eq!(done[0]["type"], "response.output_item.done");
+    assert_eq!(done[0]["item"]["phase"], "commentary");
+    assert_eq!(done.last().unwrap()["type"], "response.completed");
+    assert_eq!(done.last().unwrap()["response"]["end_turn"], false);
+}
+
+#[test]
+fn ordinary_text_without_tool_call_still_ends_turn() {
+    let mut accumulator = StreamingAccumulator::new(ToolNameMapper::default());
+    accumulator.ingest(&json!({
+        "id": "chatcmpl_1",
+        "model": "test-model",
+        "choices": [{
+            "delta": {"content": "已完成。运行测试通过。"},
+            "finish_reason": "stop"
         }]
     }));
 

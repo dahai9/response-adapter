@@ -110,7 +110,7 @@ docker run -p 8787:8787 --env-file .env responses-adapter
 | `ADAPTER_MODEL` | No | Fixed model override (bypasses model map) |
 | `ADAPTER_MODEL_MAP` | No | JSON map of incoming model names to upstream models |
 | `ADAPTER_THINKING` | No | Set to `enabled` to send thinking/reasoning fields |
-| `ADAPTER_TIMEOUT` | No | Upstream request timeout in seconds (default: 120) |
+| `ADAPTER_TIMEOUT` | No | Upstream connection timeout in seconds (default: 120). Streaming responses are not capped by a total request timeout. |
 | `ADAPTER_HOST` | No | Listen host (default: 127.0.0.1) |
 | `ADAPTER_PORT` | No | Listen port (default: 8787) |
 | `ADAPTER_MODELS` | No | JSON array of model objects for the `/v1/models` endpoint |

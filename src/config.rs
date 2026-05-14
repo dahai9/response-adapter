@@ -15,7 +15,7 @@ pub struct Config {
     pub model_map: HashMap<String, String>,
     pub model_override: Option<String>,
     pub thinking: Option<ThinkingMode>,
-    pub timeout: Duration,
+    pub connect_timeout: Duration,
     pub listen: SocketAddr,
     pub models: Vec<Value>,
 }
@@ -53,7 +53,7 @@ impl Config {
             }
             None => None,
         };
-        let timeout = non_empty_env("ADAPTER_TIMEOUT")
+        let connect_timeout = non_empty_env("ADAPTER_TIMEOUT")
             .and_then(|value| value.parse::<u64>().ok())
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(120));
@@ -74,7 +74,7 @@ impl Config {
             model_map,
             model_override,
             thinking,
-            timeout,
+            connect_timeout,
             listen,
             models,
         })
@@ -174,7 +174,7 @@ mod tests {
             model_map,
             model_override: None,
             thinking: None,
-            timeout: std::time::Duration::from_secs(120),
+            connect_timeout: std::time::Duration::from_secs(120),
             listen: "127.0.0.1:8787".parse().unwrap(),
             models: Vec::new(),
         };
@@ -190,7 +190,7 @@ mod tests {
             model_map: HashMap::new(),
             model_override: Some("model-override".into()),
             thinking: None,
-            timeout: std::time::Duration::from_secs(120),
+            connect_timeout: std::time::Duration::from_secs(120),
             listen: "127.0.0.1:8787".parse().unwrap(),
             models: Vec::new(),
         };
@@ -208,7 +208,7 @@ mod tests {
             model_map: HashMap::new(),
             model_override: None,
             thinking: None,
-            timeout: std::time::Duration::from_secs(120),
+            connect_timeout: std::time::Duration::from_secs(120),
             listen: "127.0.0.1:8787".parse().unwrap(),
             models: Vec::new(),
         };
@@ -223,7 +223,7 @@ mod tests {
             model_map: HashMap::new(),
             model_override: None,
             thinking: None,
-            timeout: std::time::Duration::from_secs(120),
+            connect_timeout: std::time::Duration::from_secs(120),
             listen: "127.0.0.1:8787".parse().unwrap(),
             models: Vec::new(),
         };

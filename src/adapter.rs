@@ -310,6 +310,7 @@ pub fn convert_input(
         Some(other) => return vec![json!({"role": "user", "content": content_to_text(other)})],
         None => return Vec::new(),
     };
+    let call_names = input_call_names(items);
 
     let mut out = Vec::new();
     for item in items {
@@ -451,11 +452,10 @@ pub fn convert_input(
                     .map(content_to_text)
                     .or_else(|| item.get("result").map(content_to_text))
                     .unwrap_or_default();
-                if item.get("type").and_then(Value::as_str) == Some("custom_tool_call_output")
-                    && item.get("name").and_then(Value::as_str) == Some("apply_patch")
+                if is_apply_patch_output(item, call_id, &call_names)
                     && apply_patch_output_needs_recovery_hint(&content)
                 {
-                    content.push_str("\n\nAdapter guidance: the apply_patch attempt failed. Do not abandon apply_patch or switch to shell heredocs. If the target file already exists, read the current file and retry with `*** Update File:`. Use `*** Add File:` only for paths that do not exist.");
+                    content.push_str(apply_patch_recovery_guidance());
                 }
                 out.push(json!({"role": "tool", "tool_call_id": call_id, "content": content}));
             }
@@ -463,6 +463,45 @@ pub fn convert_input(
         }
     }
     out
+}
+
+fn input_call_names(items: &[Value]) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    for item in items {
+        let Some(kind) = item.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        if !matches!(
+            kind,
+            "custom_tool_call" | "function_call" | "tool_search_call"
+        ) {
+            continue;
+        }
+        let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = if kind == "tool_search_call" {
+            Some("tool_search")
+        } else {
+            item.get("name").and_then(Value::as_str)
+        };
+        if let Some(name) = name {
+            names.insert(call_id.to_string(), name.to_string());
+        }
+    }
+    names
+}
+
+fn is_apply_patch_output(
+    item: &Value,
+    call_id: &str,
+    call_names: &HashMap<String, String>,
+) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("custom_tool_call_output")
+        && (item.get("name").and_then(Value::as_str) == Some("apply_patch")
+            || call_names
+                .get(call_id)
+                .is_some_and(|name| name == "apply_patch"))
 }
 
 pub fn sanitize_chat_messages(messages: Vec<Value>) -> Vec<Value> {
@@ -668,6 +707,19 @@ impl StreamingAccumulator {
         !self.content.is_empty() || !self.tool_calls.is_empty()
     }
 
+    pub fn has_stream_progress(&self) -> bool {
+        self.resp_id.is_some()
+            || self.model.is_some()
+            || !self.reasoning_content.is_empty()
+            || self.has_output_items()
+            || self.finish_reason.is_some()
+            || self.usage.is_some()
+    }
+
+    pub fn has_finish_reason(&self) -> bool {
+        self.finish_reason.is_some()
+    }
+
     pub fn ingest(&mut self, chunk: &Value) -> Vec<Value> {
         if self.resp_id.is_none() {
             self.resp_id = chunk
@@ -723,6 +775,19 @@ impl StreamingAccumulator {
     }
 
     pub fn final_events(&mut self, store: &mut ReasoningStore) -> Vec<Value> {
+        self.final_events_with_end_turn_override(store, None)
+    }
+
+    pub fn final_events_after_interruption(&mut self, store: &mut ReasoningStore) -> Vec<Value> {
+        let end_turn_override = (!self.has_finish_reason()).then_some(false);
+        self.final_events_with_end_turn_override(store, end_turn_override)
+    }
+
+    fn final_events_with_end_turn_override(
+        &mut self,
+        store: &mut ReasoningStore,
+        end_turn_override: Option<bool>,
+    ) -> Vec<Value> {
         let resp_id = self.resp_id.clone().unwrap_or_else(response_id);
         let mut events = Vec::new();
         if !self.content.is_empty() {
@@ -730,7 +795,8 @@ impl StreamingAccumulator {
                 .message_item_id
                 .get_or_insert_with(|| item_id("msg"))
                 .clone();
-            let phase = (!self.tool_calls.is_empty()).then_some("commentary");
+            let phase = (!self.tool_calls.is_empty() || self.content_needs_follow_up())
+                .then_some("commentary");
             store.remember_text_reasoning(&self.content, &self.reasoning_content);
             events.push(assistant_message_item_with_id(&id, &self.content, phase));
         }
@@ -756,9 +822,20 @@ impl StreamingAccumulator {
         // when the streamed delta contains only text or an incomplete tool call.
         // Codex treats end_turn=false as "continue sampling", so only request a
         // follow-up when we actually produced a callable Responses tool item.
-        let end_turn = !emitted_tool_call;
+        let needs_follow_up = emitted_tool_call || self.content_needs_follow_up();
+        let end_turn = end_turn_override.unwrap_or(!needs_follow_up);
         events.push(response_completed(&resp_id, self.usage.clone(), end_turn));
         events
+    }
+
+    fn content_needs_follow_up(&self) -> bool {
+        if self.content.trim().is_empty() || !self.tool_calls.is_empty() {
+            return false;
+        }
+        if matches!(self.finish_reason.as_deref(), Some("tool_calls")) {
+            return false;
+        }
+        assistant_text_is_work_preamble(&self.content)
     }
 
     fn ingest_tool_call_delta(&mut self, tool_call: &Value) {
@@ -902,11 +979,16 @@ fn apply_patch_tool_description(tool: &Value) -> String {
     description.push_str(
         "\nThis Responses freeform/custom tool is exposed through Chat Completions as a function. The function has exactly one argument named `input`; put the complete raw apply_patch patch text in `input`.",
     );
+    description.push_str(apply_patch_usage_guidance());
     if let Some(format) = tool.get("format").filter(|format| !format.is_null()) {
         description.push_str("\nOriginal Responses freeform tool format:\n");
         description.push_str(&pretty_json(format));
     }
     description
+}
+
+fn apply_patch_usage_guidance() -> &'static str {
+    "\nApply patch usage rules:\n- Always send one complete patch payload. It must start with `*** Begin Patch` and the final line must be exactly `*** End Patch`.\n- Use `*** Update File: path` for existing files, `*** Add File: path` only for new files, and `*** Delete File: path` only when removing a file.\n- For update hunks, include enough unchanged context lines around the edit so the patch can be matched. If matching fails, read the current file and retry with fresher context.\n- Prefer small focused patches. For large rewrites, split the work into multiple smaller `*** Update File:` patches instead of one huge patch.\n- Do not use shell heredocs, Python scripts, or ad hoc redirection as a fallback for file edits; retry with apply_patch.\n- Example update:\n*** Begin Patch\n*** Update File: path/to/file.py\n@@\n old line\n+new line\n*** End Patch"
 }
 
 fn pretty_json(value: &Value) -> String {
@@ -922,6 +1004,10 @@ fn apply_patch_output_needs_recovery_hint(content: &str) -> bool {
         || lower.contains("expected")
         || lower.contains("apply_patch verification failed")
         || lower.contains("invalid patch")
+}
+
+fn apply_patch_recovery_guidance() -> &'static str {
+    "\n\nAdapter guidance: the apply_patch attempt failed. Do not abandon apply_patch or switch to shell heredocs. Retry with apply_patch. If the target file already exists, read the current file and retry with `*** Update File:`. Use `*** Add File:` only for paths that do not exist. If the error says `invalid patch` or `The last line of the patch must be '*** End Patch'`, the patch payload was incomplete or malformed: split the edit into a smaller patch and ensure the final line is exactly `*** End Patch`."
 }
 
 fn custom_input_from_arguments(arguments: &str) -> String {
@@ -967,6 +1053,58 @@ fn encode_tool_name(namespace: Option<&str>, name: &str) -> String {
 fn append_string(value: &mut Value, suffix: &str) {
     let current = value.as_str().unwrap_or_default().to_string();
     *value = Value::String(format!("{current}{suffix}"));
+}
+
+fn assistant_text_is_work_preamble(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let starts_like_preamble = [
+        "now i'll",
+        "now i will",
+        "i'll",
+        "i will",
+        "let me",
+        "i'm going to",
+        "i am going to",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+        || ["开始", "现在", "接下来", "继续", "我会", "我将", "先"]
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix));
+    if !starts_like_preamble {
+        return false;
+    }
+
+    [
+        "rewrite",
+        "write",
+        "create",
+        "update",
+        "edit",
+        "implement",
+        "fix",
+        "verify",
+        "test",
+        "重写",
+        "写",
+        "创建",
+        "生成",
+        "更新",
+        "修改",
+        "编辑",
+        "实现",
+        "修复",
+        "验证",
+        "测试",
+        "优化",
+        "改进",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle) || trimmed.contains(needle))
 }
 
 pub fn response_id() -> String {
@@ -1062,6 +1200,63 @@ mod tests {
         assert_eq!(got["item"]["call_id"], "call_1");
         assert_eq!(got["item"]["name"], "apply_patch");
         assert_eq!(got["item"]["input"], "*** Begin Patch\n*** End Patch\n");
+    }
+
+    #[test]
+    fn streaming_accumulator_treats_reasoning_as_stream_progress() {
+        let mut accumulator = StreamingAccumulator::new(ToolNameMapper::default());
+
+        accumulator.ingest(&json!({
+            "id": "chatcmpl_1",
+            "model": "deepseek-chat",
+            "choices": [{
+                "delta": {"reasoning_content": "planning only"}
+            }]
+        }));
+
+        assert!(accumulator.has_stream_progress());
+        assert!(!accumulator.has_output_items());
+        let mut store = ReasoningStore::default();
+        let events = accumulator.final_events(&mut store);
+        assert_eq!(events.last().unwrap()["type"], "response.completed");
+        assert_eq!(events.last().unwrap()["response"]["end_turn"], true);
+    }
+
+    #[test]
+    fn interrupted_stream_without_finish_reason_requests_follow_up() {
+        let mut accumulator = StreamingAccumulator::new(ToolNameMapper::default());
+
+        accumulator.ingest(&json!({
+            "id": "chatcmpl_1",
+            "model": "deepseek-chat",
+            "choices": [{
+                "delta": {"content": "Now I'll rewrite"}
+            }]
+        }));
+
+        let mut store = ReasoningStore::default();
+        let events = accumulator.final_events_after_interruption(&mut store);
+        assert_eq!(events.last().unwrap()["type"], "response.completed");
+        assert_eq!(events.last().unwrap()["response"]["end_turn"], false);
+    }
+
+    #[test]
+    fn interrupted_stream_with_finish_reason_does_not_force_follow_up() {
+        let mut accumulator = StreamingAccumulator::new(ToolNameMapper::default());
+
+        accumulator.ingest(&json!({
+            "id": "chatcmpl_1",
+            "model": "deepseek-chat",
+            "choices": [{
+                "delta": {"content": "done"},
+                "finish_reason": "stop"
+            }]
+        }));
+
+        let mut store = ReasoningStore::default();
+        let events = accumulator.final_events_after_interruption(&mut store);
+        assert_eq!(events.last().unwrap()["type"], "response.completed");
+        assert_eq!(events.last().unwrap()["response"]["end_turn"], true);
     }
 
     #[test]
